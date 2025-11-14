@@ -1,0 +1,19 @@
+{
+  "name": "LoraQween Reliable Mode",
+  "description": "Надёжный режим с FaceID/IP-Adapter и ControlNet",
+  "mode": "reliable",
+  "parameters": {
+    "lora_scale": 0.9,
+    "cfg_scale": 7.5,
+    "num_steps": 60,
+    "sampler": "euler",
+    "batch_size": 2,
+    "resolution": 1024,
+    "face_id_weight": 0.6,
+    "use_controlnet": true,
+    "controlnet_type": "pose",
+    "seed": null
+  },
+  "note": "Это шаблон пресета. Для использования в ComfyUI необходимо создать полный граф."
+}
+

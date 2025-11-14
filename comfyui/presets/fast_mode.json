@@ -1,0 +1,16 @@
+{
+  "name": "LoraQween Fast Mode",
+  "description": "Быстрый режим генерации с LoRA",
+  "mode": "fast",
+  "parameters": {
+    "lora_scale": 0.8,
+    "cfg_scale": 7.0,
+    "num_steps": 40,
+    "sampler": "euler",
+    "batch_size": 4,
+    "resolution": 768,
+    "seed": null
+  },
+  "note": "Это шаблон пресета. Для использования в ComfyUI необходимо создать полный граф."
+}
+

@@ -1,0 +1,103 @@
+# Конфигурация системы LoraQween
+
+# Пути
+paths:
+  data_dir: "data"
+  datasets_dir: "data/datasets"
+  references_dir: "data/references"
+  regularization_dir: "data/regularization"
+  models_dir: "models"
+  base_model_dir: "models/base"
+  loras_dir: "models/loras"
+  face_id_dir: "models/face_id"
+  logs_dir: "logs"
+  outputs_dir: "outputs"
+  comfyui_dir: "comfyui"
+
+# Базовая модель
+base_model:
+  name: "Qwen/Qwen-Image"  # Официальная модель через diffusers (рекомендуется)
+  # Альтернатива: "models/base" для локальной модели после скачивания
+  dtype: "fp16"  # fp16/bf16 для экономии VRAM (fp8/q4 через квантизацию)
+  text_encoder: "auto"  # Автоматически из модели
+  vae: "auto"  # Автоматически из модели
+  tokenizer: "auto"  # Автоматически из модели
+
+# Параметры обучения LoRA
+training:
+  resolution: 768
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+  text_encoder_target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+  learning_rate: 5e-5
+  max_steps: 4000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  effective_batch_size: 4
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  save_steps: 500
+  eval_steps: 500
+  logging_steps: 50
+
+# Параметры инференса
+inference:
+  fast_mode:
+    lora_scale: 0.8
+    cfg_scale: 7.0
+    num_steps: 40
+    sampler: "euler"
+    batch_size: 4
+    resolution: 768
+  
+  reliable_mode:
+    lora_scale: 0.9
+    cfg_scale: 7.5
+    num_steps: 60
+    sampler: "euler"
+    batch_size: 2
+    resolution: 1024
+    face_id_weight: 0.6
+    use_controlnet: true
+
+# Контроль качества
+quality_control:
+  face_id_model: "buffalo_l"
+  similarity_threshold: 0.7
+  fpr_target: 0.01
+  tpr_target: 0.90
+  validation_split: 0.2
+  stress_test_count: 15
+
+# Управление VRAM
+vram:
+  monitor_interval: 1.0
+  fallback_threshold: 0.95
+  degraded_profile:
+    resolution: 512
+    num_steps: 30
+    batch_size: 1
+
+# Логирование
+logging:
+  retention_days: 30
+  log_level: "INFO"
+  log_inference: true
+  log_training: true
+
+# Безопасность
+security:
+  clear_exif: true
+  encrypt_references: false
+  access_control: true
+
