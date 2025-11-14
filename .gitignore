@@ -17,7 +17,6 @@ ENV/
 *~
 
 # Data and models
-data/datasets/
 data/references/
 data/regularization/
 models/base/
