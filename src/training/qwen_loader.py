@@ -27,12 +27,11 @@ class LoadedComponents:
     scheduler: Optional[Any]
 
 
-def _build_device_map(preferred_device: str) -> Dict[str, str]:
-    """Create a conservative device map so that only the trainable block lives on the GPU."""
+def _build_device_map(preferred_device: str) -> str:
+    """Return diffusers-compatible device_map representation."""
     if preferred_device == "cpu":
-        return {"transformer": "cpu", "text_encoder": "cpu", "vae": "cpu"}
-    # Place the heavy transformer on GPU, keep everything else on CPU to avoid VRAM spikes
-    return {"transformer": preferred_device, "text_encoder": "cpu", "vae": "cpu"}
+        return "cpu"
+    return "balanced"
 
 
 def load_qwen_components(
