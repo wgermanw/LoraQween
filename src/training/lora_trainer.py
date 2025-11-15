@@ -268,6 +268,7 @@ class LoRATrainer:
         )
         tokenizer = pipeline.tokenizer
         logger.info("✓ Компоненты Qwen-Image загружены")
+        pipeline_type = type(pipeline).__name__
         trainable_attr = "transformer" if getattr(pipeline, "transformer", None) is not None else "unet"
         logger.info(f"Trainable компонент: {trainable_attr}")
 
