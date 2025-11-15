@@ -690,10 +690,7 @@ class LoRATrainer:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()  # Очистить кэш после VAE
                 
-                # Sample noise
                 noise = torch.randn_like(latents)
-                
-                # Sample random timesteps
                 timesteps = torch.randint(
                     0,
                     scheduler.config.num_train_timesteps,
@@ -701,9 +698,17 @@ class LoRATrainer:
                     device=device,
                     dtype=torch.long
                 )
-                
-                # Add noise to latents
-                noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+                timesteps = timesteps.to(latents.device)
+                if hasattr(scheduler, "add_noise"):
+                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+                elif hasattr(scheduler, "sigmas"):
+                    indices = timesteps.to(torch.long)
+                    sigmas = scheduler.sigmas[indices]
+                    while sigmas.ndim < latents.ndim:
+                        sigmas = sigmas.view(-1, *([1] * (latents.ndim - 1)))
+                    noisy_latents = latents + sigmas * noise
+                else:
+                    noisy_latents = latents + noise
                 
                 # Encode text
                 # Переместить text_encoder на GPU только для forward pass
