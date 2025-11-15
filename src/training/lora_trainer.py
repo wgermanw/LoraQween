@@ -179,7 +179,8 @@ class PersonDataset(Dataset):
         return {
             'pixel_values': image,
             'input_ids': text_inputs['input_ids'].squeeze(),
-            'attention_mask': text_inputs['attention_mask'].squeeze()
+            'attention_mask': text_inputs['attention_mask'].squeeze(),
+            'captions': caption
         }
 
 
@@ -604,8 +605,29 @@ class LoRATrainer:
                 elif pixel_values.ndim != 4:
                     raise ValueError(f"Unexpected pixel_values shape {pixel_values.shape}, expected BCHW")
                 pixel_values = pixel_values.to(device, dtype=primary_dtype)
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
+
+                if self.model_backend == "flux":
+                    captions = batch.get('captions')
+                    if captions is None:
+                        raise ValueError("Batch is missing 'captions' required for Flux backend")
+                    if isinstance(captions, (list, tuple)):
+                        caption_texts = list(captions)
+                    else:
+                        caption_texts = [captions]
+                    max_length = getattr(tokenizer, "model_max_length", 77)
+                    max_length = min(max_length, 77)
+                    tokenized = tokenizer(
+                        caption_texts,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=max_length,
+                        return_tensors="pt"
+                    )
+                    input_ids = tokenized['input_ids'].to(device)
+                    attention_mask = tokenized['attention_mask'].to(device)
+                else:
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
                 
                 # Encode изображения в latent space через VAE
                 # Переместить VAE на GPU только для forward pass
