@@ -363,26 +363,6 @@ class LoRATrainer:
             text_encoder = get_peft_model(pipeline.text_encoder, text_encoder_lora_config)
             pipeline.text_encoder = text_encoder
             logger.info("✓ LoRA применена к text_encoder")
-
-            try:
-                peft_model = text_encoder
-                base_model = getattr(peft_model, "base_model", None)
-                if base_model is None and hasattr(peft_model, "model"):
-                    base_model = peft_model.model
-                if base_model is None:
-                    base_model = peft_model
-
-                orig_clip_forward = base_model.forward
-
-                def clip_forward_no_inputs_embeds(*args, **kwargs):
-                    if "inputs_embeds" in kwargs:
-                        logger.warning("Убрал лишний kwargs inputs_embeds перед CLIPTextModel.forward")
-                        kwargs.pop("inputs_embeds", None)
-                    return orig_clip_forward(*args, **kwargs)
-
-                base_model.forward = clip_forward_no_inputs_embeds
-            except Exception as e:
-                logger.warning(f"Не удалось запатчить base_model.forward: {e}")
         
         return pipeline, tokenizer, model_dtype
     
@@ -611,9 +591,9 @@ class LoRATrainer:
                     if captions is None:
                         raise ValueError("Batch is missing 'captions' required for Flux backend")
                     if isinstance(captions, (list, tuple)):
-                        caption_texts = list(captions)
+                        caption_texts = [c.strip() if isinstance(c, str) else "" for c in captions]
                     else:
-                        caption_texts = [captions]
+                        caption_texts = [captions.strip() if isinstance(captions, str) else ""]
                     max_length = getattr(tokenizer, "model_max_length", 77)
                     max_length = min(max_length, 77)
                     tokenized = tokenizer(
@@ -625,6 +605,13 @@ class LoRATrainer:
                     )
                     input_ids = tokenized['input_ids'].to(device)
                     attention_mask = tokenized['attention_mask'].to(device)
+                    logger.info(
+                        "Token check: shape=%s, min=%s, max=%s, vocab_size=%s",
+                        tuple(input_ids.shape),
+                        input_ids.min().item(),
+                        input_ids.max().item(),
+                        getattr(text_encoder.config, 'vocab_size', 'unknown')
+                    )
                 else:
                     input_ids = batch['input_ids'].to(device)
                     attention_mask = batch['attention_mask'].to(device)

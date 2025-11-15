@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 from diffusers import DiffusionPipeline
-from transformers import AutoTokenizer, AutoProcessor
+from transformers import AutoProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -54,17 +54,7 @@ def load_flux_components(
 
     processor = getattr(pipeline, "image_processor", getattr(pipeline, "processor", None))
 
-    tokenizer = None
-    if tokenizer_path and tokenizer_path.exists():
-        logger.info("Используется кастомный токенайзер: %s", tokenizer_path)
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-    else:
-        tokenizer = getattr(pipeline, "tokenizer", None)
-        if tokenizer is None:
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=True)
-            except Exception:
-                tokenizer = None
+    tokenizer = getattr(pipeline, "tokenizer", None)
 
     if processor is None:
         try:
