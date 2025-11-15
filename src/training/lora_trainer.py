@@ -805,18 +805,22 @@ class LoRATrainer:
                     try:
                         # Попробовать стандартный API для transformer
                         if hasattr(trainable_model, 'forward'):
-                            # Qwen Image transformer
-                            model_pred = trainable_model(
-                                sample=noisy_latents,
-                                timestep=timesteps,
-                                encoder_hidden_states=encoder_hidden_states,
-                                return_dict=False
-                            )
-                            # Может вернуть tuple или tensor
-                            if isinstance(model_pred, tuple):
-                                model_pred = model_pred[0]
+                            if self.model_backend == "flux":
+                                model_pred = trainable_model(
+                                    sample=noisy_latents,
+                                    timestep=timesteps,
+                                    encoder_hidden_states=encoder_hidden_states,
+                                )
+                            else:
+                                model_pred = trainable_model(
+                                    sample=noisy_latents,
+                                    timestep=timesteps,
+                                    encoder_hidden_states=encoder_hidden_states,
+                                    return_dict=False
+                                )
+                                if isinstance(model_pred, tuple):
+                                    model_pred = model_pred[0]
                         else:
-                            # Fallback для unet
                             model_pred = trainable_model(
                                 noisy_latents,
                                 timesteps,
