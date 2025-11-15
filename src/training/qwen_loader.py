@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional, Any, Dict
+from typing import Optional, Any
 
 import torch
 from diffusers import DiffusionPipeline, DDPMScheduler
@@ -25,13 +25,6 @@ class LoadedComponents:
     tokenizer: Any
     processor: Optional[Any]
     scheduler: Optional[Any]
-
-
-def _build_device_map(preferred_device: str) -> str:
-    """Return diffusers-compatible device_map representation."""
-    if preferred_device == "cpu":
-        return "cpu"
-    return "balanced"
 
 
 def load_qwen_components(
@@ -62,32 +55,28 @@ def load_qwen_components(
     if tokenizer_path is not None and not isinstance(tokenizer_path, Path):
         tokenizer_path = Path(tokenizer_path)
 
-    loading_kwargs: Dict[str, Any] = {
+    loading_kwargs: dict[str, Any] = {
         "torch_dtype": dtype,
         "trust_remote_code": True,
         "use_safetensors": True,
-        "low_cpu_mem_usage": True,
-        "device_map": _build_device_map(device if torch.cuda.is_available() else "cpu"),
     }
 
-    max_memory: Dict[Any, str] = {}
-    if torch.cuda.is_available() and max_vram_gb:
-        max_memory[0] = f"{max_vram_gb}GiB"
-    if max_cpu_ram_gb:
-        max_memory["cpu"] = f"{max_cpu_ram_gb}GiB"
-    if max_memory:
-        loading_kwargs["max_memory"] = max_memory
-    if offload_state_dict:
-        loading_kwargs["offload_state_dict"] = True
-
     logger.info(
-        "Loading Qwen-Image with low_cpu_mem_usage=%s, device_map=%s, max_memory=%s",
-        loading_kwargs["low_cpu_mem_usage"],
-        loading_kwargs["device_map"],
-        loading_kwargs.get("max_memory"),
+        "Loading Qwen-Image without device_map/low_cpu_mem_usage (dtype=%s)",
+        dtype,
+    )
+    logger.debug(
+        "max_cpu_ram_gb=%s, max_vram_gb=%s, offload_state_dict=%s",
+        max_cpu_ram_gb,
+        max_vram_gb,
+        offload_state_dict,
     )
 
     pipeline = DiffusionPipeline.from_pretrained(model_id, **loading_kwargs)
+
+    target_device = "cuda" if torch.cuda.is_available() and device != "cpu" else "cpu"
+    pipeline.to(target_device)
+    logger.info("Qwen components moved to %s", target_device)
 
     processor = getattr(pipeline, "image_processor", getattr(pipeline, "processor", None))
     scheduler = getattr(pipeline, "scheduler", None)
