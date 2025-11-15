@@ -363,6 +363,24 @@ class LoRATrainer:
             text_encoder = get_peft_model(pipeline.text_encoder, text_encoder_lora_config)
             pipeline.text_encoder = text_encoder
             logger.info("✓ LoRA применена к text_encoder")
+
+            if self.model_backend == "flux" and text_encoder is not None:
+                peft_model = text_encoder
+                base_model = getattr(peft_model, "base_model", None)
+                if base_model is None and hasattr(peft_model, "model"):
+                    base_model = peft_model.model
+                if base_model is None:
+                    base_model = peft_model
+
+                orig_forward = base_model.forward
+
+                def forward_no_inputs_embeds(*args, **kwargs):
+                    if "inputs_embeds" in kwargs:
+                        logger.warning("Dropping unsupported kwarg 'inputs_embeds' for CLIPTextModel.forward")
+                        kwargs.pop("inputs_embeds", None)
+                    return orig_forward(*args, **kwargs)
+
+                base_model.forward = forward_no_inputs_embeds
         
         return pipeline, tokenizer, model_dtype
     
