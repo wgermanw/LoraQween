@@ -810,6 +810,7 @@ class LoRATrainer:
                                     sample=noisy_latents,
                                     timestep=timesteps,
                                     encoder_hidden_states=encoder_hidden_states,
+                                    cross_attention_kwargs={}
                                 )
                             else:
                                 model_pred = trainable_model(
