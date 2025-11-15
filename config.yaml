@@ -1,6 +1,5 @@
-# Конфигурация системы LoraQween
+# Основная конфигурация LoraQween
 
-# Пути
 paths:
   data_dir: "data"
   datasets_dir: "data/datasets"
@@ -14,16 +13,13 @@ paths:
   outputs_dir: "outputs"
   comfyui_dir: "comfyui"
 
-# Базовая модель
 base_model:
-  name: "Qwen/Qwen-Image"  # Официальная модель через diffusers (рекомендуется)
-  # Альтернатива: "models/base" для локальной модели после скачивания
-  dtype: "fp16"  # fp16/bf16 для экономии VRAM (fp8/q4 через квантизацию)
-  text_encoder: "auto"  # Автоматически из модели
-  vae: "auto"  # Автоматически из модели
-  tokenizer: "auto"  # Автоматически из модели
+  name: "Qwen/Qwen-Image"
+  dtype: "bf16"
+  text_encoder: "auto"
+  vae: "auto"
+  tokenizer: "auto"
 
-# Параметры обучения LoRA
 training:
   resolution: 768
   lora_rank: 16
@@ -50,7 +46,15 @@ training:
   eval_steps: 500
   logging_steps: 50
 
-# Параметры инференса
+hardware:
+  max_cpu_ram_gb: 40
+  max_vram_gb: 24
+  dataloader_workers: 2
+  prefetch_factor: 1
+  max_batch_size: 2
+  device_map: "cuda"
+  offload_state_dict: true
+
 inference:
   fast_mode:
     lora_scale: 0.8
@@ -59,7 +63,7 @@ inference:
     sampler: "euler"
     batch_size: 4
     resolution: 768
-  
+
   reliable_mode:
     lora_scale: 0.9
     cfg_scale: 7.5
@@ -70,7 +74,6 @@ inference:
     face_id_weight: 0.6
     use_controlnet: true
 
-# Контроль качества
 quality_control:
   face_id_model: "buffalo_l"
   similarity_threshold: 0.7
@@ -79,7 +82,6 @@ quality_control:
   validation_split: 0.2
   stress_test_count: 15
 
-# Управление VRAM
 vram:
   monitor_interval: 1.0
   fallback_threshold: 0.95
@@ -88,16 +90,13 @@ vram:
     num_steps: 30
     batch_size: 1
 
-# Логирование
 logging:
   retention_days: 30
   log_level: "INFO"
   log_inference: true
   log_training: true
 
-# Безопасность
 security:
   clear_exif: true
   encrypt_references: false
   access_control: true
-

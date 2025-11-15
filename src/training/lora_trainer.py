@@ -3,16 +3,18 @@
 import json
 import logging
 from pathlib import Path
+import os
 from typing import Optional, Dict
 from datetime import datetime
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoProcessor
-from diffusers import DiffusionPipeline, DDPMScheduler
+from diffusers import DDPMScheduler
 from peft import LoraConfig, get_peft_model, TaskType
 from accelerate import Accelerator
 from tqdm import tqdm
+from .qwen_loader import load_qwen_components
 
 logger = logging.getLogger(__name__)
 
@@ -199,34 +201,28 @@ class LoRATrainer:
         self.dataset_dir = Path(dataset_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.hardware = config.get('hardware', {})
+        self.max_cpu_ram_gb = self.hardware.get('max_cpu_ram_gb', 40)
+        self.max_vram_gb = self.hardware.get('max_vram_gb', 24)
+        self.dataloader_workers = max(0, int(self.hardware.get('dataloader_workers', 2)))
+        self.prefetch_factor = max(1, int(self.hardware.get('prefetch_factor', 1)))
+        self.max_batch_size = self.hardware.get('max_batch_size')
+        self.offload_state_dict = self.hardware.get('offload_state_dict', True)
+        self.device_map = self.hardware.get('device_map', 'cuda')
         
-        # Инициализировать accelerator
-        # Для GPU с compute capability >= sm_120 (RTX 50xx) принудительно используем CPU из-за несовместимости сборок
-        use_cpu = False
-        if torch.cuda.is_available():
-            try:
-                cc = torch.cuda.get_device_capability(0)
-                if cc and cc[0] >= 12:
-                    use_cpu = True
-            except Exception:
-                pass
-        
-        if use_cpu:
-            self.accelerator = Accelerator(
-                cpu=True,
-                gradient_accumulation_steps=config.get('gradient_accumulation_steps', 4),
-                mixed_precision="no"
-            )
-            logger.warning("⚠️ Обнаружена архитектура GPU sm_12x. Используется CPU-режим для стабильности.")
-        else:
-            self.accelerator = Accelerator(
-                gradient_accumulation_steps=config.get('gradient_accumulation_steps', 4),
-                mixed_precision=config.get('mixed_precision', 'bf16')
-            )
-        
-        logger.info(f"Инициализирован тренер LoRA")
-        logger.info(f"  Mixed precision: {config.get('mixed_precision', 'bf16')}")
-        logger.info(f"  Gradient accumulation: {config.get('gradient_accumulation_steps', 4)}")
+        accelerator_kwargs = {
+            "gradient_accumulation_steps": config.get('gradient_accumulation_steps', 4),
+            "mixed_precision": config.get('mixed_precision', 'bf16')
+        }
+        if not torch.cuda.is_available():
+            accelerator_kwargs["cpu"] = True
+            accelerator_kwargs["mixed_precision"] = "no"
+        self.accelerator = Accelerator(**accelerator_kwargs)
+        self.device = self.accelerator.device
+        logger.info("Инициализирован тренер LoRA")
+        logger.info(f"  Mixed precision: {accelerator_kwargs['mixed_precision']}")
+        logger.info(f"  Gradient accumulation: {accelerator_kwargs['gradient_accumulation_steps']}")
     
     def setup_model(self):
         """Настроить модель и LoRA."""
@@ -244,70 +240,37 @@ class LoRATrainer:
         else:
             dtype = torch.float16
         
-        # Загрузить токенайзер из датасета (с добавленными токенами)
+
+        # Загрузить токенайзер из датасета (если он уже расширен)
         tokenizer_path = self.dataset_dir / "tokenizer"
-        if tokenizer_path.exists():
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(self.base_model_path, trust_remote_code=True)
-        
-        # Загрузить модель Qwen-Image через diffusers
-        import os
-        from diffusers import DiffusionPipeline
-        
-        # Установить кэш на диск D если есть
-        # Проверить, установлены ли переменные окружения
-        if 'HF_HOME' not in os.environ or 'HF_HUB_CACHE' not in os.environ:
-            cache_path = Path("D:/huggingface_cache")
-            if Path("D:/").exists():
-                cache_path.mkdir(parents=True, exist_ok=True)
-                hub_cache = cache_path / "hub"
-                hub_cache.mkdir(parents=True, exist_ok=True)
-                os.environ['HF_HOME'] = str(cache_path)
-                os.environ['HF_HUB_CACHE'] = str(hub_cache)
-                logger.info(f"✓ Кэш Hugging Face установлен на: {cache_path}")
-                logger.info(f"  HF_HOME = {os.environ['HF_HOME']}")
-                logger.info(f"  HF_HUB_CACHE = {os.environ['HF_HUB_CACHE']}")
-            else:
-                logger.warning("Диск D не найден, используется стандартный кэш")
-        
-        logger.info(f"Загрузка модели из: {self.base_model_path}")
-        # Для RTX 5060 Ti пробуем использовать float16 для лучшей совместимости
-        # Если mixed_precision = bf16, но GPU не поддерживает, используем fp16
+        tokenizer_override = tokenizer_path if tokenizer_path.exists() else None
+
         model_dtype = dtype
         if dtype == torch.bfloat16:
-            # Проверить поддержку bfloat16 на GPU
             try:
-                test = torch.randn(1, 1, device="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16)
-                del test
-            except Exception:
-                logger.info("bfloat16 не поддерживается, используем float16")
+                if not torch.cuda.is_available():
+                    raise RuntimeError("CUDA недоступна")
+                capability = torch.cuda.get_device_capability()
+                if capability[0] < 8:
+                    raise RuntimeError("GPU не поддерживает bfloat16")
+            except Exception as exc:
+                logger.info("bfloat16 не поддерживается (%s), используем float16", exc)
                 model_dtype = torch.float16
-        
-        # Использовать dtype вместо torch_dtype (новый API)
-        try:
-            pipeline = DiffusionPipeline.from_pretrained(
-                self.base_model_path,
-                dtype=model_dtype,  # Используем dtype вместо torch_dtype
-                trust_remote_code=True,
-                local_files_only=False  # Разрешить скачивание если нужно
-            )
-        except TypeError:
-            # Если dtype не поддерживается, используем torch_dtype (старый API)
-            logger.debug("dtype не поддерживается, используем torch_dtype")
-            pipeline = DiffusionPipeline.from_pretrained(
-                self.base_model_path,
-                torch_dtype=model_dtype,
-                trust_remote_code=True,
-                local_files_only=False
-            )
-        
-        logger.info("✓ Модель загружена успешно")
-        
-        # Определить тип pipeline и доступные компоненты
-        pipeline_type = type(pipeline).__name__
-        logger.info(f"Тип pipeline: {pipeline_type}")
-        
+
+        pipeline = load_qwen_components(
+            self.base_model_path,
+            model_dtype,
+            tokenizer_path=tokenizer_override,
+            max_cpu_ram_gb=self.max_cpu_ram_gb,
+            max_vram_gb=self.max_vram_gb,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            offload_state_dict=self.offload_state_dict,
+        )
+        tokenizer = pipeline.tokenizer
+        logger.info("✓ Компоненты Qwen-Image загружены")
+        trainable_attr = "transformer" if getattr(pipeline, "transformer", None) is not None else "unet"
+        logger.info(f"Trainable компонент: {trainable_attr}")
+
         # Проверить доступные компоненты более надёжным способом
         has_transformer = False
         has_unet = False
@@ -410,12 +373,16 @@ class LoRATrainer:
             logger.info("✓ Используется стандартная обработка изображений")
         
         # Настроить scheduler (остаётся на CPU, не занимает много памяти)
-        scheduler = DDPMScheduler.from_pretrained(
-            self.base_model_path,
-            subfolder="scheduler",
-            trust_remote_code=True
-        )
-        logger.info("✓ Scheduler загружен (на CPU)")
+        if getattr(pipeline, "scheduler", None) is not None:
+            scheduler = pipeline.scheduler
+            logger.info("✓ Scheduler получен из Qwen компонентов")
+        else:
+            scheduler = DDPMScheduler.from_pretrained(
+                self.base_model_path,
+                subfolder="scheduler",
+                trust_remote_code=True
+            )
+            logger.info("✓ Scheduler загружен (на CPU)")
         
         # Получить trainable модель (transformer или unet)
         trainable_model = None
@@ -434,15 +401,31 @@ class LoRATrainer:
         
         # Загрузить датасет
         resolution = _to_number(self.config.get('resolution', 768), 768, int)
-        batch_size = _to_number(self.config.get('batch_size', 1), 1, int)
+        requested_batch = _to_number(self.config.get('batch_size', 1), 1, int)
+        batch_size = requested_batch
+        if self.max_batch_size and batch_size > self.max_batch_size:
+            logger.warning(
+                "Batch size %s превышает лимит %s — уменьшено автоматически", requested_batch, self.max_batch_size
+            )
+            batch_size = self.max_batch_size
+        elif self.max_vram_gb and self.max_vram_gb <= 24 and batch_size > 1:
+            logger.info("Профиль 24GB VRAM: batch_size=1 для стабильности")
+            batch_size = 1
         
         dataset = PersonDataset(self.dataset_dir, tokenizer, processor, resolution)
-        dataloader = DataLoader(
-            dataset, 
-            batch_size=batch_size, 
+        worker_cap = max(0, min(self.dataloader_workers, max((os.cpu_count() or 1) - 1, 0)))
+        pin_memory = torch.cuda.is_available()
+        dataloader_kwargs = dict(
+            dataset=dataset,
+            batch_size=batch_size,
             shuffle=True,
-            num_workers=0  # Для Windows
+            num_workers=worker_cap,
+            pin_memory=pin_memory,
+            persistent_workers=worker_cap > 0,
         )
+        if worker_cap > 0:
+            dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
+        dataloader = DataLoader(**dataloader_kwargs)
         logger.info(f"✓ Датасет загружен: {len(dataset)} изображений")
         
         # Настроить оптимизатор только для trainable параметров
@@ -840,4 +823,3 @@ class LoRATrainer:
                 logger.warning(f"Не удалось сохранить text_encoder: {e}")
         
         logger.info(f"✓ Чекпоинт сохранён: {checkpoint_dir}")
-

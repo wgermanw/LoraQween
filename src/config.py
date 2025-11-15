@@ -64,6 +64,11 @@ class Config:
         """Получить параметры контроля качества."""
         return self._config.get('quality_control', {})
 
+    @property
+    def hardware(self) -> Dict[str, Any]:
+        """Получить ограничения железа."""
+        return self._config.get('hardware', {})
+
 
 # Глобальный экземпляр конфигурации
 _config_instance = None
