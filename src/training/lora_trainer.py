@@ -575,19 +575,21 @@ class LoRATrainer:
                     break
                 
                 # Переместить batch на устройство
-                pixel_values = batch['pixel_values'].to(device)
+                pixel_values = batch['pixel_values']
+                # Приводим к формату BCHW
+                if pixel_values.ndim == 5 and pixel_values.shape[1] == 1:
+                    pixel_values = pixel_values[:, 0]
+                elif pixel_values.ndim == 3:
+                    pixel_values = pixel_values.unsqueeze(0)
+                elif pixel_values.ndim != 4:
+                    raise ValueError(f"Unexpected pixel_values shape {pixel_values.shape}, expected BCHW")
+                pixel_values = pixel_values.to(device, dtype=primary_dtype)
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 
                 # Encode изображения в latent space через VAE
                 # Переместить VAE на GPU только для forward pass
                 with torch.no_grad():
-                    # Qwen Image VAE ожидает формат [batch, channels, num_frames, height, width]
-                    # Добавить dimension для num_frames если нужно
-                    if len(pixel_values.shape) == 4:
-                        # [batch, channels, height, width] -> [batch, channels, 1, height, width]
-                        pixel_values = pixel_values.unsqueeze(2)
-                    
                     # Попробовать использовать GPU сначала
                     vae_device = device
                     use_cpu_fallback = False
