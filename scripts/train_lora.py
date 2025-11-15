@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import get_config
 from src.training.lora_trainer import LoRATrainer
+from src.training.flux_lora_trainer import FluxLoRATrainer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,35 +22,45 @@ def main():
     parser = argparse.ArgumentParser(description="Обучение LoRA для персоны")
     parser.add_argument("--person", type=str, required=True, help="Имя персоны")
     parser.add_argument("--trigger_token", type=str, default=None, help="Триггер-токен")
-    
+
     args = parser.parse_args()
-    
+
     # Загрузить конфигурацию
     config = get_config()
     paths = config.paths
-    
+
     # Найти датасет персоны
     dataset_dir = paths['datasets_dir'] / args.person
     if not dataset_dir.exists():
         logger.error(f"Датасет для персоны '{args.person}' не найден: {dataset_dir}")
         logger.error("Сначала запустите prepare_data.py")
         return 1
-    
+
     # Директория для сохранения LoRA
     lora_dir = paths['loras_dir'] / args.person
     lora_dir.mkdir(parents=True, exist_ok=True)
-    
+
     model_config = config.model
-    base_model_path = model_config.get('base_model_id') or config.get('base_model.name', 'Qwen/Qwen-Image')
-    trainer = LoRATrainer(
-        config=config.training,
-        model_config=model_config,
-        base_model_path=base_model_path,
-        dataset_dir=dataset_dir,
-        output_dir=lora_dir,
-        paths=paths
-    )
-    
+    backend = model_config.get('backend', 'flux').lower()
+
+    if backend == 'flux':
+        trainer = FluxLoRATrainer(
+            model_config=model_config,
+            dataset_dir=dataset_dir,
+            output_dir=lora_dir,
+            config=config.training
+        )
+    else:
+        base_model_path = model_config.get('base_model_id') or config.get('base_model.name', 'Qwen/Qwen-Image')
+        trainer = LoRATrainer(
+            config=config.training,
+            model_config=model_config,
+            base_model_path=base_model_path,
+            dataset_dir=dataset_dir,
+            output_dir=lora_dir,
+            paths=paths
+        )
+
     # Запустить обучение
     try:
         manifest_file = trainer.train()
@@ -63,4 +74,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
