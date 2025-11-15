@@ -698,12 +698,16 @@ class LoRATrainer:
                     device=device,
                     dtype=torch.long
                 )
-                timesteps = timesteps.to(latents.device)
                 if hasattr(scheduler, "add_noise"):
+                    timesteps = timesteps.to(latents.device)
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
                 elif hasattr(scheduler, "sigmas"):
-                    indices = timesteps.to(torch.long)
+                    indices = timesteps
+                    if indices.dtype != torch.long:
+                        indices = indices.to(torch.long)
+                    indices = indices.to(device=scheduler.sigmas.device)
                     sigmas = scheduler.sigmas[indices]
+                    sigmas = sigmas.to(latents.device)
                     while sigmas.ndim < latents.ndim:
                         sigmas = sigmas.view(-1, *([1] * (latents.ndim - 1)))
                     noisy_latents = latents + sigmas * noise
