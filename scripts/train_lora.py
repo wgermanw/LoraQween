@@ -39,13 +39,15 @@ def main():
     lora_dir = paths['loras_dir'] / args.person
     lora_dir.mkdir(parents=True, exist_ok=True)
     
-    # Создать тренер
-    base_model_path = config.get('base_model.name', 'Qwen/Qwen2-VL-7B-Instruct')
+    model_config = config.model
+    base_model_path = model_config.get('base_model_id') or config.get('base_model.name', 'Qwen/Qwen-Image')
     trainer = LoRATrainer(
         config=config.training,
+        model_config=model_config,
         base_model_path=base_model_path,
         dataset_dir=dataset_dir,
-        output_dir=lora_dir
+        output_dir=lora_dir,
+        paths=paths
     )
     
     # Запустить обучение

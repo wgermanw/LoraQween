@@ -89,6 +89,7 @@ def load_qwen_components(
         processor=processor,
         image_processor=processor,
         scheduler=scheduler,
+        dtype=dtype,
     )
 
     # Replace tokenizer if dataset provided its own vocabulary

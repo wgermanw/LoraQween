@@ -186,7 +186,7 @@ class PersonDataset(Dataset):
 class LoRATrainer:
     """Тренер для обучения LoRA."""
     
-    def __init__(self, config: dict, base_model_path: str, dataset_dir: Path, output_dir: Path):
+    def __init__(self, config: dict, model_config: dict, base_model_path: str, dataset_dir: Path, output_dir: Path, paths: Optional[Dict[str, Path]] = None):
         """
         Инициализировать тренер.
         
@@ -197,7 +197,11 @@ class LoRATrainer:
             output_dir: Директория для сохранения результатов
         """
         self.config = config
+        self.model_config = model_config or {}
         self.base_model_path = base_model_path
+        self.model_id = self.model_config.get('base_model_id') or self.base_model_path
+        self.model_backend = self.model_config.get('backend', 'flux').lower()
+        self.paths = paths or {}
         self.dataset_dir = Path(dataset_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -209,7 +213,6 @@ class LoRATrainer:
         self.prefetch_factor = max(1, int(self.hardware.get('prefetch_factor', 1)))
         self.max_batch_size = self.hardware.get('max_batch_size')
         self.offload_state_dict = self.hardware.get('offload_state_dict', True)
-        self.device_map = self.hardware.get('device_map', 'cuda')
         
         accelerator_kwargs = {
             "gradient_accumulation_steps": config.get('gradient_accumulation_steps', 4),
@@ -257,18 +260,39 @@ class LoRATrainer:
                 logger.info("bfloat16 не поддерживается (%s), используем float16", exc)
                 model_dtype = torch.float16
 
-        pipeline = load_qwen_components(
-            self.base_model_path,
-            model_dtype,
-            tokenizer_path=tokenizer_override,
-            max_cpu_ram_gb=self.max_cpu_ram_gb,
-            max_vram_gb=self.max_vram_gb,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            offload_state_dict=self.offload_state_dict,
-        )
+        model_id = self.model_id
+        pipeline = None
+
+        if self.model_backend == "flux":
+            from .flux_loader import load_flux_components
+            local_flux_dir = None
+            base_model_dir = self.paths.get('base_model_dir')
+            if base_model_dir:
+                local_flux_dir = Path(base_model_dir) / "flux"
+            pipeline = load_flux_components(
+                model_id,
+                model_dtype,
+                tokenizer_path=tokenizer_override,
+                local_dir=local_flux_dir,
+                revision=self.model_config.get('revision'),
+                variant=self.model_config.get('variant'),
+            )
+            logger.info("✓ Компоненты FLUX.1-dev загружены")
+        else:
+            pipeline = load_qwen_components(
+                model_id,
+                model_dtype,
+                tokenizer_path=tokenizer_override,
+                max_cpu_ram_gb=self.max_cpu_ram_gb,
+                max_vram_gb=self.max_vram_gb,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                offload_state_dict=self.offload_state_dict,
+            )
+            logger.info("✓ Компоненты Qwen-Image загружены")
+
         tokenizer = pipeline.tokenizer
-        logger.info("✓ Компоненты Qwen-Image загружены")
-        pipeline_type = type(pipeline).__name__
+        primary_dtype = getattr(pipeline, "dtype", model_dtype)
+        pipeline_type = f"{self.model_backend}:{type(pipeline).__name__}"
         trainable_attr = "transformer" if getattr(pipeline, "transformer", None) is not None else "unet"
         logger.info(f"Trainable компонент: {trainable_attr}")
 
@@ -361,7 +385,7 @@ class LoRATrainer:
         else:
             # Попробовать загрузить processor отдельно
             try:
-                processor = AutoProcessor.from_pretrained(self.base_model_path, trust_remote_code=True)
+                processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
                 processor_type = type(processor).__name__
             except Exception as e:
                 logger.warning(f"Не удалось загрузить processor: {e}")
@@ -376,10 +400,10 @@ class LoRATrainer:
         # Настроить scheduler (остаётся на CPU, не занимает много памяти)
         if getattr(pipeline, "scheduler", None) is not None:
             scheduler = pipeline.scheduler
-            logger.info("✓ Scheduler получен из Qwen компонентов")
+            logger.info("✓ Scheduler получен из компонентов модели")
         else:
             scheduler = DDPMScheduler.from_pretrained(
-                self.base_model_path,
+                self.model_id,
                 subfolder="scheduler",
                 trust_remote_code=True
             )
@@ -788,7 +812,7 @@ class LoRATrainer:
         manifest = {
             'training_date': datetime.now().isoformat(),
             'config': self.config,
-            'base_model': self.base_model_path,
+            'base_model': self.model_id,
             'dataset_dir': str(self.dataset_dir),
             'status': 'completed',
             'total_steps': global_step,

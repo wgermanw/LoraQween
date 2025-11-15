@@ -85,6 +85,13 @@ python scripts/train_lora.py --person alex --trigger_token "<qwn_alex>"
 python scripts/inference.py --person alex --prompt "<qwn_alex> portrait, smiling" --mode fast
 ```
 
+## Бэкенд модели
+
+- В `config.yaml` появилась секция `model`. По умолчанию `backend: "flux"` и `base_model_id: "black-forest-labs/FLUX.1-dev"`, то есть обучение строится на FLUX.1-dev от Black Forest Labs (рекомендуемый вариант для RTX 4090 48 ГБ).
+- Если нужна старая схема с Qwen-Image, смените параметр `backend` на `qwen`. В этом режиме используются прежние поля `base_model.*`, скрипты `scripts/download_qwen_image.py` и существующий LoRA пайплайн.
+- Для кастомных весов Flux укажите локальный путь в `model.base_model_id` или поместите их в `models/base/flux` — загрузчик автоматически найдёт директорию.
+- Остальные параметры (`training.target_modules`, `text_encoder_target_modules`, `hardware.max_vram_gb` и т.д.) продолжают работать в обоих бэкендах.
+
 ## Запуск на vast.ai / Linux
 
 1. Клонируйте репозиторий и создайте окружение (Python 3.10+).
@@ -98,10 +105,10 @@ python scripts/inference.py --person alex --prompt "<qwn_alex> portrait, smiling
 
 Скрипт `train_with_cache.sh` создаёт локальный Hugging Face cache в `.cache/huggingface` (можно переопределить переменными `HF_HOME`/`HF_HUB_CACHE`) и прокидывает их в `python scripts/train_lora.py`. Подробнее о структуре папок — в `data/README.md` и `models/README.md`.
 
-## Настройка железа и low-memory загрузка
+## Настройка железа
 
-- В `config.yaml` появилась секция `hardware`. По умолчанию она рассчитана на машину с RTX 4090 (24 ГБ VRAM) и ~40 ГБ системной RAM.  
-- Параметры `max_cpu_ram_gb` и `max_vram_gb` пробрасываются в загрузчик `load_qwen_components`, который собирает только нужные блоки Qwen-Image (transformer, text encoder, VAE, tokenizer) через `low_cpu_mem_usage` и `device_map`. Остальные части пайплайна остаются на CPU или выгружаются обратно после использования.  
+- В `config.yaml` есть секция `hardware`. Значения по умолчанию рассчитаны на 24–48 ГБ VRAM (Flux) и могут быть увеличены под более мощные конфигурации.  
+- `max_cpu_ram_gb` и `max_vram_gb` используются тренером для выбора batch size, политики перевода VAE/text encoder между CPU и GPU и общего профиля памяти — теперь всё делается без `device_map` и meta-тензоров.  
 - `dataloader_workers`, `prefetch_factor` и `max_batch_size` позволяют ограничить число воркеров и автоматически уменьшать batch size, если видеопамяти недостаточно.  
 - Если железо слабее, скорректируйте эти значения и перезапустите обучение. Для более мощных машин достаточно увеличить `max_batch_size` и, при необходимости, снять ограничение на workers.
 

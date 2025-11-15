@@ -69,6 +69,20 @@ class Config:
         """Получить ограничения железа."""
         return self._config.get('hardware', {})
 
+    @property
+    def model(self) -> Dict[str, Any]:
+        """Получить настройки модели/бэкенда."""
+        model_cfg = self._config.get('model', {})
+        if not model_cfg:
+            # Фолбэк на старый формат
+            legacy = self._config.get('base_model', {})
+            return {
+                'backend': 'qwen',
+                'base_model_id': legacy.get('name', 'Qwen/Qwen-Image'),
+                'dtype': legacy.get('dtype', 'bf16')
+            }
+        return model_cfg
+
 
 # Глобальный экземпляр конфигурации
 _config_instance = None
