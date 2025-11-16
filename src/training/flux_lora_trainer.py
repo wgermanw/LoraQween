@@ -268,7 +268,8 @@ class FluxLoRATrainer:
         clip_text_encoder = components.text_encoder.to(self.accelerator.device, dtype=dtype) if components.text_encoder is not None else None
         t5_text_encoder = getattr(components, "text_encoder_2", None)
         if t5_text_encoder is not None:
-            t5_text_encoder = t5_text_encoder.to(self.accelerator.device, dtype=dtype)
+            # держим T5 на CPU в float32, чтобы экономить VRAM
+            t5_text_encoder = t5_text_encoder.to("cpu", dtype=torch.float32)
         transformer = components.transformer
         scheduler = components.scheduler or DDPMScheduler.from_pretrained(
             self.model_config.get("base_model_id"), subfolder="scheduler"
@@ -366,8 +367,9 @@ class FluxLoRATrainer:
                         max_length=min(getattr(t5_tokenizer, "model_max_length", 512), 512),
                         return_tensors="pt",
                     )
-                    t5_input_ids = t5_tok["input_ids"].to(self.accelerator.device)
-                    t5_attention_mask = t5_tok["attention_mask"].to(self.accelerator.device)
+                    # T5 на CPU
+                    t5_input_ids = t5_tok["input_ids"]
+                    t5_attention_mask = t5_tok["attention_mask"]
                 else:
                     # Fallback: use CLIP tokens if T5 tokenizer missing
                     t5_input_ids = clip_input_ids
@@ -394,7 +396,8 @@ class FluxLoRATrainer:
                             input_ids=t5_input_ids,
                             attention_mask=t5_attention_mask,
                         )
-                        encoder_hidden_states = t5_out[0]
+                        # перенести результат на девайс акселератора и нужный dtype
+                        encoder_hidden_states = t5_out[0].to(self.accelerator.device, dtype=dtype)
                     else:
                         # Fallback to CLIP last_hidden_state (dim 768)
                         clip_out_fallback = clip_text_encoder(
