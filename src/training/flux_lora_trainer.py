@@ -484,7 +484,28 @@ class FluxLoRATrainer:
                         return_dict=False,
                     )
                     model_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
-                    loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+
+                    # ------------------------------------------------------------
+                    # Распаковать предсказание обратно в латентную сетку [B, C, H, W]
+                    # чтобы оно совпадало по форме с noise / pixel_latents.
+                    b, c, h, w = pixel_latents.shape
+                    h_half, w_half = h // 2, w // 2
+
+                    # Ожидаем форму [B, (H/2 * W/2), C*4]
+                    if model_pred.shape[0] != b or model_pred.shape[1] != h_half * w_half or model_pred.shape[2] != c * 4:
+                        raise RuntimeError(
+                            f"Unexpected transformer output shape {tuple(model_pred.shape)} "
+                            f"for latents shape {(b, c, h, w)} (expected tokens={(h_half * w_half, c * 4)})"
+                        )
+
+                    # [B, (H/2*W/2), C*4] -> [B, H/2, W/2, C, 2, 2] -> [B, C, H, W]
+                    noise_pred = model_pred.view(b, h_half, w_half, c, 2, 2)
+                    noise_pred = noise_pred.permute(0, 3, 1, 4, 2, 5).reshape(b, c, h, w)
+
+                    # Flow-matching таргет: (noise - latents)
+                    target = (noise - pixel_latents).detach()
+
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
                     self.accelerator.backward(loss)
                     optimizer.step()
                     optimizer.zero_grad()
