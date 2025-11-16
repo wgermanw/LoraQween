@@ -232,12 +232,14 @@ class FluxLoRATrainer:
                     model_input = scheduler.scale_model_input(noisy_latents, timesteps)
 
                 with self.accelerator.accumulate(transformer):
-                    model_pred = transformer(
-                        sample=model_input,
+                    # Flux transformer expects hidden_states + timestep + encoder_hidden_states
+                    model_out = transformer(
+                        hidden_states=model_input,
                         timestep=timesteps,
                         encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs={},
+                        return_dict=False,
                     )
+                    model_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
                     loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                     self.accelerator.backward(loss)
                     optimizer.step()
