@@ -260,8 +260,13 @@ class FluxLoRATrainer:
         max_steps = int(self.config.get("max_steps", 1000))
         progress_bar = tqdm(range(max_steps), disable=not self.accelerator.is_local_main_process)
 
-        # We pass BCHW latents directly; let Flux x_embedder handle patchification internally.
-        x_in_features = None
+        # Detect expected x_embedder input features (e.g., 3072 for FLUX.1-dev)
+        try:
+            raw_tx = self.accelerator.unwrap_model(transformer)
+            x_embedder = getattr(raw_tx, "x_embedder", None)
+            x_in_features = getattr(x_embedder, "in_features", None)
+        except Exception:
+            x_in_features = None
         
         # Try to detect pooled_projection expected dimension for time_text_embed
         pooled_proj_dim = None
@@ -397,8 +402,44 @@ class FluxLoRATrainer:
                 if hasattr(scheduler, "scale_model_input"):
                     model_input = scheduler.scale_model_input(noisy_latents, timesteps)
 
-                # No manual unfold; keep BCHW format for Flux x_embedder
+                # If transformer expects flattened patch vectors (e.g., in_features=3072),
+                # and we currently have BCHW tensors, convert to (B, tokens, in_features)
                 patch_grid_h, patch_grid_w = None, None
+                if x_in_features is not None and model_input.ndim == 4:
+                    bsz, channels, height, width = model_input.shape
+                    if x_in_features % max(channels, 1) == 0:
+                        required_area = x_in_features // max(channels, 1)
+                        # Search factor pairs (kh, kw) such that kh*kw == required_area and divides HxW
+                        best_pair = None
+                        best_score = 1e9
+                        # Enumerate divisors
+                        for kh in range(1, int(math.sqrt(required_area)) + 1):
+                            if required_area % kh != 0:
+                                continue
+                            kw = required_area // kh
+                            if kh <= height and kw <= width and height % kh == 0 and width % kw == 0:
+                                # Prefer more square token grid
+                                gh = height // kh
+                                gw = width // kw
+                                score = abs(gh - gw)
+                                if score < best_score:
+                                    best_score = score
+                                    best_pair = (kh, kw)
+                            # Also try swapped factors
+                            if kw <= height and kh <= width and height % kw == 0 and width % kh == 0:
+                                gh = height // kw
+                                gw = width // kh
+                                score = abs(gh - gw)
+                                if score < best_score:
+                                    best_score = score
+                                    best_pair = (kw, kh)
+                        if best_pair is not None:
+                            kh, kw = best_pair
+                            unfolded = F.unfold(model_input, kernel_size=(kh, kw), stride=(kh, kw))  # [B, C*kh*kw, L]
+                            model_input = unfolded.transpose(1, 2).contiguous()  # [B, L, x_in_features]
+                            patch_grid_h = height // kh
+                            patch_grid_w = width // kw
+                        # else: keep BCHW and let model handle if possible
 
                 # Prepare required conditioning for Flux time/text embedding
                 bsz = model_input.shape[0]
