@@ -367,19 +367,39 @@ class FluxLoRATrainer:
                                 last_hidden = clip_out[0]
                             pooled_from_clip = last_hidden.mean(dim=1)
 
-                # Flow Matching noise schedule for FLUX: mix pixel_latents with noise using random t in (0,1)
+                # Flow Matching noise schedule for FLUX: mix latents with noise using random t in (0,1)
                 bsz = pixel_latents.shape[0]
                 t = torch.sigmoid(torch.randn((bsz,), device=self.accelerator.device, dtype=dtype))
                 noise = torch.randn_like(pixel_latents)
                 model_input = (1 - t.view(bsz, 1, 1, 1)) * pixel_latents + t.view(bsz, 1, 1, 1) * noise
                 timesteps = t  # pass continuous t to transformer
-
-                # Flux x_embedder expects NHWC (B, H, W, C) with C=3; convert if BCHW provided
-                if model_input.ndim == 4 and model_input.shape[1] in (3, 4, 16):
-                    # If AE produced more channels, keep first 3 for RGB-like input
-                    if model_input.shape[1] > 3:
+                
+                # Patchify to match Flux x_embedder expected in_features (3072 = 3*32*32)
+                if model_input.ndim == 4:
+                    # Ensure 3 channels
+                    c = model_input.shape[1]
+                    if c > 3:
                         model_input = model_input[:, :3, :, :]
-                    model_input = model_input.permute(0, 2, 3, 1).contiguous()
+                    elif c < 3:
+                        pad = torch.zeros(
+                            (model_input.shape[0], 3 - c, model_input.shape[2], model_input.shape[3]),
+                            device=model_input.device,
+                            dtype=model_input.dtype,
+                        )
+                        model_input = torch.cat([model_input, pad], dim=1)
+                    # Ensure divisible by patch size
+                    ph, pw = 32, 32
+                    h, w = model_input.shape[2], model_input.shape[3]
+                    if (h % ph) != 0 or (w % pw) != 0:
+                        # center crop to nearest multiple
+                        new_h = (h // ph) * ph
+                        new_w = (w // pw) * pw
+                        top = (h - new_h) // 2
+                        left = (w - new_w) // 2
+                        model_input = model_input[:, :, top:top+new_h, left:left+new_w]
+                    # Unfold patches to [B, L, 3*ph*pw] = [B, L, 3072]
+                    unfolded = F.unfold(model_input, kernel_size=(ph, pw), stride=(ph, pw))  # [B, 3*ph*pw, L]
+                    model_input = unfolded.transpose(1, 2).contiguous()  # [B, L, 3072]
 
                 # Не делаем ручной unfold — оставляем BCHW
                 patch_grid_h, patch_grid_w = None, None
