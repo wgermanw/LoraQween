@@ -447,6 +447,31 @@ class FluxLoRATrainer:
                     device=self.accelerator.device,
                     dtype=dtype,
                 )
+                # Provide img_ids required by Flux transformer; basic zero positions per image token
+                if model_input.ndim == 3:
+                    # [B, L, D] -> create [B, L, 2]
+                    num_tokens = model_input.shape[1]
+                    img_ids = torch.zeros(
+                        (bsz, num_tokens, 2),
+                        device=self.accelerator.device,
+                        dtype=dtype,
+                    )
+                elif model_input.ndim == 4:
+                    # [B, C, H, W] -> create [B, H*W, 2]
+                    _, _, h, w = model_input.shape
+                    num_tokens = int(h * w)
+                    img_ids = torch.zeros(
+                        (bsz, num_tokens, 2),
+                        device=self.accelerator.device,
+                        dtype=dtype,
+                    )
+                else:
+                    # Fallback to a single token placeholder
+                    img_ids = torch.zeros(
+                        (bsz, 1, 2),
+                        device=self.accelerator.device,
+                        dtype=dtype,
+                    )
 
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
@@ -457,6 +482,7 @@ class FluxLoRATrainer:
                         guidance=guidance_vec,
                         pooled_projections=pooled_projections,
                         txt_ids=txt_ids,
+                        img_ids=img_ids,
                         return_dict=False,
                     )
                     model_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
