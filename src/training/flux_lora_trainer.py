@@ -224,6 +224,26 @@ class FluxLoRATrainer:
             x_in_features = getattr(x_embedder, "in_features", None)
         except Exception:
             x_in_features = None
+        
+        # Try to detect pooled_projection expected dimension for time_text_embed
+        pooled_proj_dim = None
+        try:
+            if "raw_tx" not in locals():
+                raw_tx = self.accelerator.unwrap_model(transformer)
+            time_text_embed = getattr(raw_tx, "time_text_embed", None)
+            if time_text_embed is not None:
+                # Common attribute name
+                proj_layer = getattr(time_text_embed, "pooled_projection_proj", None)
+                if hasattr(proj_layer, "in_features"):
+                    pooled_proj_dim = int(getattr(proj_layer, "in_features"))
+                else:
+                    # Heuristic: find a Linear with 'pooled' in its name
+                    for name, module in time_text_embed.named_modules():
+                        if "pooled" in name and hasattr(module, "in_features"):
+                            pooled_proj_dim = int(getattr(module, "in_features"))
+                            break
+        except Exception:
+            pooled_proj_dim = None
 
         step = 0
         while step < max_steps:
@@ -306,12 +326,42 @@ class FluxLoRATrainer:
                             # As a last resort, keep BCHW; the model may still support it
                             pass
 
+                # Prepare required conditioning for Flux time/text embedding
+                bsz = model_input.shape[0]
+                try:
+                    guidance_value = float(self.config.get("guidance", 3.5))
+                except Exception:
+                    guidance_value = 3.5
+                guidance_vec = torch.full(
+                    (bsz,),
+                    guidance_value,
+                    device=self.accelerator.device,
+                    dtype=dtype,
+                )
+                # Try to form pooled_projections from encoder_hidden_states if dimensions match, else zeros
+                pooled_projections = None
+                if pooled_proj_dim is not None:
+                    pooled_from_text = encoder_hidden_states.mean(dim=1)
+                    if pooled_from_text.shape[-1] == pooled_proj_dim:
+                        pooled_projections = pooled_from_text
+                    else:
+                        pooled_projections = torch.zeros(
+                            (bsz, pooled_proj_dim),
+                            device=self.accelerator.device,
+                            dtype=dtype,
+                        )
+                else:
+                    # Fallback to mean-pooled text; Flux may project internally
+                    pooled_projections = encoder_hidden_states.mean(dim=1)
+
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
                     model_out = transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
                         encoder_hidden_states=encoder_hidden_states,
+                        guidance=guidance_vec,
+                        pooled_projections=pooled_projections,
                         return_dict=False,
                     )
                     model_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
