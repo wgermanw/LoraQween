@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import inspect
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
@@ -103,6 +104,32 @@ class FluxLoRATrainer:
                 task_type=TaskType.FEATURE_EXTRACTION,
             )
             components.text_encoder = get_peft_model(components.text_encoder, text_cfg)
+
+            # Patch CLIP text encoder forward to discard unsupported kwargs such as inputs_embeds.
+            peft_model = components.text_encoder
+            base_model = getattr(peft_model, "base_model", None)
+            if base_model is None and hasattr(peft_model, "model"):
+                base_model = peft_model.model
+            if base_model is None:
+                base_model = peft_model
+
+            orig_forward = base_model.forward
+            forward_sig = inspect.signature(orig_forward)
+
+            def forward_filtered(*args, **kwargs):
+                removed = []
+                for key in list(kwargs.keys()):
+                    if key not in forward_sig.parameters:
+                        kwargs.pop(key, None)
+                        removed.append(key)
+                if removed:
+                    logger.warning(
+                        "Dropping unsupported kwargs %s for CLIPTextModel.forward",
+                        ", ".join(sorted(set(removed))),
+                    )
+                return orig_forward(*args, **kwargs)
+
+            base_model.forward = forward_filtered
 
         return components, dtype
 
