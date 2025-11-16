@@ -318,20 +318,8 @@ class FluxLoRATrainer:
                 pixel_values = batch["pixel_values"].to(self.accelerator.device, dtype=dtype)
 
                 with torch.no_grad():
-                    latents = vae.encode(pixel_values).latent_dist.sample()
-                    latents = latents * getattr(vae.config, "scaling_factor", 0.18215)
-                    # Ensure expected channel count (4) for Flux x_embedder (4 * patch_area = 64 in_features)
-                    if latents.ndim == 4 and latents.shape[1] != 4:
-                        c = latents.shape[1]
-                        if c > 4:
-                            latents = latents[:, :4, :, :]
-                        else:
-                            pad = torch.zeros(
-                                (latents.shape[0], 4 - c, latents.shape[2], latents.shape[3]),
-                                device=latents.device,
-                                dtype=latents.dtype,
-                            )
-                            latents = torch.cat([latents, pad], dim=1)
+                    # Use pixel space latents for FLUX (3-channel), not VAE latents
+                    pixel_latents = pixel_values.to(self.accelerator.device, dtype=dtype)
                     # T5 for encoder_hidden_states (B, seq, 4096)
                     if t5_text_encoder is not None:
                         t5_out = t5_text_encoder(
@@ -368,35 +356,12 @@ class FluxLoRATrainer:
                                 last_hidden = clip_out[0]
                             pooled_from_clip = last_hidden.mean(dim=1)
 
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(
-                    0,
-                    scheduler.config.num_train_timesteps,
-                    (latents.shape[0],),
-                    device=latents.device,
-                    dtype=torch.long,
-                )
-                # Add noise depending on scheduler capabilities
-                if hasattr(scheduler, "add_noise"):
-                    timesteps = timesteps.to(latents.device)
-                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                elif hasattr(scheduler, "sigmas"):
-                    indices = timesteps
-                    if indices.dtype != torch.long:
-                        indices = indices.to(torch.long)
-                    indices = indices.to(device=scheduler.sigmas.device)
-                    sigmas = scheduler.sigmas[indices]
-                    sigmas = sigmas.to(latents.device)
-                    while sigmas.ndim < latents.ndim:
-                        sigmas = sigmas.view(-1, *([1] * (latents.ndim - 1)))
-                    noisy_latents = latents + sigmas * noise
-                else:
-                    noisy_latents = latents + noise
-                
-                # Scale input for scheduler if required
-                model_input = noisy_latents
-                if hasattr(scheduler, "scale_model_input"):
-                    model_input = scheduler.scale_model_input(noisy_latents, timesteps)
+                # Flow Matching noise schedule for FLUX: mix pixel_latents with noise using random t in (0,1)
+                bsz = pixel_latents.shape[0]
+                t = torch.sigmoid(torch.randn((bsz,), device=self.accelerator.device, dtype=dtype))
+                noise = torch.randn_like(pixel_latents)
+                model_input = (1 - t.view(bsz, 1, 1, 1)) * pixel_latents + t.view(bsz, 1, 1, 1) * noise
+                timesteps = t  # pass continuous t to transformer
 
                 # Не делаем ручной unfold — оставляем BCHW
                 patch_grid_h, patch_grid_w = None, None
