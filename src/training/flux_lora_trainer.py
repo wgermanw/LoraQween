@@ -114,12 +114,21 @@ class FluxLoRATrainer:
                 base_model = peft_model
 
             orig_forward = base_model.forward
-            forward_sig = inspect.signature(orig_forward)
+            # Use an allowlist of known-safe kwargs for CLIPTextModel to avoid
+            # accidentally dropping required ones due to wrapper layers.
+            allowed_keys = {
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "return_dict",
+                "output_attentions",
+                "output_hidden_states",
+            }
 
             def forward_filtered(*args, **kwargs):
                 removed = []
                 for key in list(kwargs.keys()):
-                    if key not in forward_sig.parameters:
+                    if key not in allowed_keys:
                         kwargs.pop(key, None)
                         removed.append(key)
                 if removed:
