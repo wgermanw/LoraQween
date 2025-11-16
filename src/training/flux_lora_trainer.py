@@ -15,6 +15,7 @@ from diffusers import DDPMScheduler
 from peft import LoraConfig, get_peft_model, TaskType
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from .flux_loader import load_flux_components
 
@@ -216,6 +217,14 @@ class FluxLoRATrainer:
         max_steps = int(self.config.get("max_steps", 1000))
         progress_bar = tqdm(range(max_steps), disable=not self.accelerator.is_local_main_process)
 
+        # Try to detect expected transformer x-embed input size once
+        try:
+            raw_tx = self.accelerator.unwrap_model(transformer)
+            x_embedder = getattr(raw_tx, "x_embedder", None)
+            x_in_features = getattr(x_embedder, "in_features", None)
+        except Exception:
+            x_in_features = None
+
         step = 0
         while step < max_steps:
             for batch in dataloader:
@@ -269,6 +278,33 @@ class FluxLoRATrainer:
                 model_input = noisy_latents
                 if hasattr(scheduler, "scale_model_input"):
                     model_input = scheduler.scale_model_input(noisy_latents, timesteps)
+
+                # If transformer expects flattened patch vectors (e.g., in_features=3072),
+                # and we currently have BCHW tensors, convert to (B, tokens, in_features)
+                if x_in_features is not None and model_input.ndim == 4:
+                    bsz, channels, height, width = model_input.shape
+                    if x_in_features % channels == 0:
+                        required_area = x_in_features // channels
+                        # Find (kh, kw) such that kh*kw == required_area and divides HxW grid
+                        kh, kw = None, None
+                        # Prefer square-ish factors, but accept any valid tiling
+                        for h_factor in range(int(required_area**0.5), 0, -1):
+                            if required_area % h_factor != 0:
+                                continue
+                            w_factor = required_area // h_factor
+                            if h_factor <= height and w_factor <= width and height % h_factor == 0 and width % w_factor == 0:
+                                kh, kw = h_factor, w_factor
+                                break
+                        # Fallback to row-wise tiling if possible
+                        if kh is None and required_area <= width and width % required_area == 0:
+                            kh, kw = 1, required_area
+                        # Apply unfold if we found a feasible tiling
+                        if kh is not None and kw is not None:
+                            unfolded = F.unfold(model_input, kernel_size=(kh, kw), stride=(kh, kw))  # [B, C*kh*kw, L]
+                            model_input = unfolded.transpose(1, 2).contiguous()  # [B, L, x_in_features]
+                        else:
+                            # As a last resort, keep BCHW; the model may still support it
+                            pass
 
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
