@@ -330,32 +330,33 @@ class FluxLoRATrainer:
                         # Fallback to raw pixels if AE encode is unavailable
                         pixel_latents = pixel_values.to(self.accelerator.device, dtype=dtype)
                     pixel_latents = pixel_latents.to(self.accelerator.device, dtype=dtype)
-                # T5 for encoder_hidden_states (B, seq, 4096)
+                    # T5 for encoder_hidden_states (B, seq, 4096)
                     if t5_text_encoder is not None:
-                    t5_out = t5_text_encoder(
-                        input_ids=t5_input_ids,
-                        attention_mask=t5_attention_mask,
-                    )
-                    encoder_hidden_states = t5_out[0]
+                        t5_out = t5_text_encoder(
+                            input_ids=t5_input_ids,
+                            attention_mask=t5_attention_mask,
+                        )
+                        encoder_hidden_states = t5_out[0]
                     else:
                         # Fallback to CLIP last_hidden_state (dim 768)
-                    clip_out_fallback = clip_text_encoder(
+                        clip_out_fallback = clip_text_encoder(
                             input_ids=clip_input_ids,
                             attention_mask=clip_attention_mask,
                         )
-                    encoder_hidden_states = clip_out_fallback[0]
+                        encoder_hidden_states = clip_out_fallback[0]
+
                     # CLIP pooled for pooled_projections (B, 768)
                     pooled_from_clip = None
-                if clip_text_encoder is not None:
-                    clip_out = clip_text_encoder(
-                        input_ids=clip_input_ids,
-                        attention_mask=clip_attention_mask,
-                    )
-                    # try pooler_output, else mean of last_hidden_state
-                    pooled_from_clip = getattr(clip_out, "pooler_output", None)
-                    if pooled_from_clip is None:
-                        last_hidden = clip_out[0]
-                        pooled_from_clip = last_hidden.mean(dim=1)
+                    if clip_text_encoder is not None:
+                        clip_out = clip_text_encoder(
+                            input_ids=clip_input_ids,
+                            attention_mask=clip_attention_mask,
+                        )
+                        # try pooler_output, else mean of last_hidden_state
+                        pooled_from_clip = getattr(clip_out, "pooler_output", None)
+                        if pooled_from_clip is None:
+                            last_hidden = clip_out[0]
+                            pooled_from_clip = last_hidden.mean(dim=1)
 
                 # Flow Matching noise schedule for FLUX: mix latents with noise using random t in (0,1)
                 bsz = pixel_latents.shape[0]
@@ -434,7 +435,7 @@ class FluxLoRATrainer:
                     break
 
         progress_bar.close()
-        self._save_lora(transformer, text_encoder)
+        self._save_lora(transformer, clip_text_encoder)
 
         manifest = {
             "training_date": datetime.now().isoformat(),
