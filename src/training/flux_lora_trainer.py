@@ -132,49 +132,6 @@ class FluxLoRATrainer:
                 return tx_orig_forward(*args, **kwargs)
 
             base_tx.forward = tx_forward_filtered
-
-            # Patch x_embedder to apply linear along the last dimension robustly
-            x_emb = getattr(base_tx, "x_embedder", None)
-            if x_emb is not None and hasattr(x_emb, "forward") and hasattr(x_emb, "weight"):
-                x_emb_orig_forward = x_emb.forward
-                weight = getattr(x_emb, "weight", None)
-                bias = getattr(x_emb, "bias", None)
-                in_features = int(weight.shape[1]) if weight is not None else None
-                out_features = int(weight.shape[0]) if weight is not None else None
-
-                def x_emb_forward_safe(hidden_states, *xa, **xk):
-                    # Ensure last dim matches in_features; reshape to 2D for F.linear then restore
-                    if in_features is None:
-                        return x_emb_orig_forward(hidden_states, *xa, **xk)
-                    original_shape = hidden_states.shape
-                    if original_shape[-1] != in_features:
-                        # Try to move channels/features to the last dim if 4D BCHW or BHWC
-                        if hidden_states.ndim == 4:
-                            # Prefer NHWC last-dim arrangement
-                            if original_shape[1] in (in_features, 3, 4, 16):
-                                hidden_states = hidden_states.permute(0, 2, 3, 1).contiguous()
-                            # If still not matching, fallback to flatten spatial and project if divisible
-                            if hidden_states.shape[-1] != in_features:
-                                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-                                if flat.shape[-1] == in_features:
-                                    projected = torch.nn.functional.linear(flat, weight, bias)
-                                    return projected.view(*original_shape[:-1], out_features)
-                                else:
-                                    # As a last resort, defer to original
-                                    return x_emb_orig_forward(hidden_states, *xa, **xk)
-                        else:
-                            # Non-4D: flatten last dim if it matches via reshape
-                            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-                            if flat.shape[-1] == in_features:
-                                projected = torch.nn.functional.linear(flat, weight, bias)
-                                return projected.view(*original_shape[:-1], out_features)
-                            return x_emb_orig_forward(hidden_states, *xa, **xk)
-                    # Happy path: last dim already matches in_features
-                    flat = hidden_states.reshape(-1, in_features)
-                    projected = torch.nn.functional.linear(flat, weight, bias)
-                    return projected.view(*original_shape[:-1], out_features)
-
-                x_emb.forward = x_emb_forward_safe
         except Exception:
             # If patching fails, proceed without filtering
             pass
@@ -221,7 +178,7 @@ class FluxLoRATrainer:
                 )
                 components.text_encoder = get_peft_model(components.text_encoder, text_cfg)
 
-                # Patch text encoder forward to discard unsupported kwargs such as inputs_embeds.
+                # Patch text encoder forward to drop only unsupported 'inputs_embeds'
                 peft_model = components.text_encoder
                 base_model = getattr(peft_model, "base_model", None)
                 if base_model is None and hasattr(peft_model, "model"):
@@ -230,29 +187,16 @@ class FluxLoRATrainer:
                     base_model = peft_model
 
                 orig_forward = base_model.forward
-                allowed_keys = {
-                    "input_ids",
-                    "attention_mask",
-                    "position_ids",
-                    "return_dict",
-                    "output_attentions",
-                    "output_hidden_states",
-                }
 
-                def forward_filtered(*args, **kwargs):
-                    removed = []
-                    for key in list(kwargs.keys()):
-                        if key not in allowed_keys:
-                            kwargs.pop(key, None)
-                            removed.append(key)
-                    if removed:
+                def forward_no_inputs_embeds(*args, **kwargs):
+                    if "inputs_embeds" in kwargs:
                         logger.warning(
-                            "Dropping unsupported kwargs %s for text_encoder.forward",
-                            ", ".join(sorted(set(removed))),
+                            "Dropping unsupported kwarg 'inputs_embeds' for CLIPTextModel.forward"
                         )
+                        kwargs.pop("inputs_embeds", None)
                     return orig_forward(*args, **kwargs)
 
-                base_model.forward = forward_filtered
+                base_model.forward = forward_no_inputs_embeds
             else:
                 logger.warning("No matching target modules found in text_encoder; skipping LoRA on text_encoder.")
 
@@ -303,23 +247,21 @@ class FluxLoRATrainer:
         max_steps = int(self.config.get("max_steps", 1000))
         progress_bar = tqdm(range(max_steps), disable=not self.accelerator.is_local_main_process)
 
-        # Detect expected x_embedder input features (e.g., 3072 for FLUX.1-dev)
-        # Определить ожидаемую размерность признаков на последней оси для x_embedder
+        # Определить in_features, которые ожидает x_embedder на последней оси
         x_in_features = None
-        x_expected_last = None
         try:
             raw_tx = self.accelerator.unwrap_model(transformer)
             x_emb = getattr(raw_tx, "x_embedder", None)
             if x_emb is not None:
-                weight = getattr(x_emb, "weight", None)
-                # weight shape обычно (out_features, in_features)
-                if weight is not None and hasattr(weight, "shape"):
-                    x_in_features = int(weight.shape[1])
-                    # В transformer_flux используется умножение hidden_states @ weight,
-                    # поэтому ожидаемая последняя размерность hidden_states = weight.shape[0]
-                    x_expected_last = int(weight.shape[0])
+                if hasattr(x_emb, "in_features"):
+                    x_in_features = int(getattr(x_emb, "in_features"))
+                else:
+                    weight = getattr(x_emb, "weight", None)
+                    if weight is not None and hasattr(weight, "shape"):
+                        # weight shape == (out_features, in_features)
+                        x_in_features = int(weight.shape[1])
         except Exception:
-            pass
+            x_in_features = None
         
         # Try to detect pooled_projection expected dimension for time_text_embed
         pooled_proj_dim = None
@@ -388,41 +330,32 @@ class FluxLoRATrainer:
                         # Fallback to raw pixels if AE encode is unavailable
                         pixel_latents = pixel_values.to(self.accelerator.device, dtype=dtype)
                     pixel_latents = pixel_latents.to(self.accelerator.device, dtype=dtype)
-                    # T5 for encoder_hidden_states (B, seq, 4096)
+                # T5 for encoder_hidden_states (B, seq, 4096)
                     if t5_text_encoder is not None:
-                        t5_out = t5_text_encoder(
-                            input_ids=t5_input_ids,
-                            attention_mask=t5_attention_mask,
-                            return_dict=True,
-                        )
-                        encoder_hidden_states = getattr(t5_out, "last_hidden_state", None)
-                        if encoder_hidden_states is None:
-                            encoder_hidden_states = t5_out[0]
+                    t5_out = t5_text_encoder(
+                        input_ids=t5_input_ids,
+                        attention_mask=t5_attention_mask,
+                    )
+                    encoder_hidden_states = t5_out[0]
                     else:
                         # Fallback to CLIP last_hidden_state (dim 768)
-                        clip_out_fallback = clip_text_encoder(
+                    clip_out_fallback = clip_text_encoder(
                             input_ids=clip_input_ids,
                             attention_mask=clip_attention_mask,
-                            return_dict=True,
                         )
-                        encoder_hidden_states = getattr(clip_out_fallback, "last_hidden_state", None)
-                        if encoder_hidden_states is None:
-                            encoder_hidden_states = clip_out_fallback[0]
+                    encoder_hidden_states = clip_out_fallback[0]
                     # CLIP pooled for pooled_projections (B, 768)
                     pooled_from_clip = None
-                    if clip_text_encoder is not None:
-                        clip_out = clip_text_encoder(
-                            input_ids=clip_input_ids,
-                            attention_mask=clip_attention_mask,
-                            return_dict=True,
-                        )
-                        pooled_from_clip = getattr(clip_out, "pooler_output", None)
-                        if pooled_from_clip is None:
-                            # mean pool across sequence
-                            last_hidden = getattr(clip_out, "last_hidden_state", None)
-                            if last_hidden is None:
-                                last_hidden = clip_out[0]
-                            pooled_from_clip = last_hidden.mean(dim=1)
+                if clip_text_encoder is not None:
+                    clip_out = clip_text_encoder(
+                        input_ids=clip_input_ids,
+                        attention_mask=clip_attention_mask,
+                    )
+                    # try pooler_output, else mean of last_hidden_state
+                    pooled_from_clip = getattr(clip_out, "pooler_output", None)
+                    if pooled_from_clip is None:
+                        last_hidden = clip_out[0]
+                        pooled_from_clip = last_hidden.mean(dim=1)
 
                 # Flow Matching noise schedule for FLUX: mix latents with noise using random t in (0,1)
                 bsz = pixel_latents.shape[0]
@@ -431,23 +364,26 @@ class FluxLoRATrainer:
                 model_input = (1 - t.view(bsz, 1, 1, 1)) * pixel_latents + t.view(bsz, 1, 1, 1) * noise
                 timesteps = t  # pass continuous t to transformer
                 
-                # Привести вход к ожидаемой последней размерности для x_embedder (обычно 64)
-                if model_input.ndim == 4 and x_expected_last is not None:
-                    b, c, h, w = model_input.shape
-                    if c > x_expected_last:
-                        model_input = model_input[:, :x_expected_last, :, :]
-                    elif c < x_expected_last:
-                        pad = torch.zeros(
-                            (b, x_expected_last - c, h, w),
-                            device=model_input.device,
-                            dtype=model_input.dtype,
-                        )
-                        model_input = torch.cat([model_input, pad], dim=1)
-                    # Свернуть в последовательность токенов с последней размерностью x_expected_last
-                    model_input = model_input.permute(0, 2, 3, 1).contiguous().view(b, h * w, x_expected_last)
+                # Упаковать латенты как в официальном FluxPipeline: [B, C, H, W] -> [B, (H//2)*(W//2), C*4]
+                def _pack_latents(latents: torch.Tensor) -> torch.Tensor:
+                    b, c, h, w = latents.shape
+                    # гарантировать чётные H и W
+                    if (h % 2) != 0:
+                        latents = latents[:, :, :h - 1, :]
+                        h = h - 1
+                    if (w % 2) != 0:
+                        latents = latents[:, :, :, :w - 1]
+                        w = w - 1
+                    latents = latents.view(b, c, h // 2, 2, w // 2, 2)
+                    latents = latents.permute(0, 2, 4, 1, 3, 5)
+                    latents = latents.reshape(b, (h // 2) * (w // 2), c * 4)
+                    return latents
 
-                # Не делаем ручной unfold — оставляем BCHW
-                patch_grid_h, patch_grid_w = None, None
+                hidden_states = _pack_latents(model_input)
+                if x_in_features is not None and hidden_states.shape[-1] != x_in_features:
+                    raise RuntimeError(
+                        f"packed latents last dim {hidden_states.shape[-1]} != x_embedder.in_features {x_in_features}"
+                    )
 
                 # Prepare required conditioning for Flux time/text embedding
                 bsz = model_input.shape[0]
@@ -478,7 +414,7 @@ class FluxLoRATrainer:
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
                     model_out = transformer(
-                        hidden_states=model_input,
+                        hidden_states=hidden_states,
                         timestep=timesteps,
                         encoder_hidden_states=encoder_hidden_states,
                         guidance=guidance_vec,
