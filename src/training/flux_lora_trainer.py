@@ -440,6 +440,14 @@ class FluxLoRATrainer:
                         dtype=dtype,
                     )
 
+                # Provide txt_ids required by Flux transformer; use simple zero placeholders per token
+                t5_seq_len = int(t5_input_ids.shape[1]) if "t5_input_ids" in locals() else int(clip_input_ids.shape[1])
+                txt_ids = torch.zeros(
+                    (bsz, t5_seq_len),
+                    device=self.accelerator.device,
+                    dtype=dtype,
+                )
+
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
                     model_out = transformer(
@@ -448,6 +456,7 @@ class FluxLoRATrainer:
                         encoder_hidden_states=encoder_hidden_states,
                         guidance=guidance_vec,
                         pooled_projections=pooled_projections,
+                        txt_ids=txt_ids,
                         return_dict=False,
                     )
                     model_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
