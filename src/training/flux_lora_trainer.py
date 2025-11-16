@@ -6,7 +6,6 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Dict
 
 import torch
@@ -22,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class FluxPersonDataset(Dataset):
-    """Dataset returning pixel tensors and raw captions."""
+    """Dataset returning pixel tensors and raw captions from metadata.jsonl."""
 
     def __init__(self, dataset_dir: Path, resolution: int = 512):
         from PIL import Image
@@ -30,14 +29,13 @@ class FluxPersonDataset(Dataset):
 
         self.dataset_dir = Path(dataset_dir)
         self.items = []
+        self.Image = Image
         self.transform = transforms.Compose([
             transforms.Resize((resolution, resolution)),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ])
-
         metadata = self.dataset_dir / "metadata.jsonl"
-        self.Image = Image
         with open(metadata, "r", encoding="utf-8") as f:
             for line in f:
                 obj = json.loads(line)
@@ -47,7 +45,6 @@ class FluxPersonDataset(Dataset):
                         "image_path": image_path,
                         "caption": obj["caption"],
                     })
-
         logger.info("Flux dataset loaded: %s samples", len(self.items))
 
     def __len__(self):
@@ -63,6 +60,8 @@ class FluxPersonDataset(Dataset):
 
 
 class FluxLoRATrainer:
+    """Dedicated trainer for FLUX.1-dev."""
+
     def __init__(self, model_config: Dict, dataset_dir: Path, output_dir: Path, config: Dict):
         self.model_config = model_config
         self.dataset_dir = Path(dataset_dir)
@@ -74,7 +73,7 @@ class FluxLoRATrainer:
             mixed_precision=config.get("mixed_precision", "bf16"),
         )
 
-    def setup(self) -> SimpleNamespace:
+    def setup(self):
         dtype = torch.bfloat16 if self.model_config.get("dtype", "bf16") == "bf16" else torch.float16
         components = load_flux_components(
             self.model_config.get("base_model_id"),
@@ -105,17 +104,24 @@ class FluxLoRATrainer:
             )
             components.text_encoder = get_peft_model(components.text_encoder, text_cfg)
 
-        return components
+        return components, dtype
 
     def train(self):
-        components = self.setup()
+        components, dtype = self.setup()
         tokenizer = components.tokenizer
-        vae = components.vae
-        text_encoder = components.text_encoder
+        vae = components.vae.to(self.accelerator.device, dtype=dtype)
+        text_encoder = components.text_encoder.to(self.accelerator.device, dtype=dtype)
         transformer = components.transformer
         scheduler = components.scheduler or DDPMScheduler.from_pretrained(
             self.model_config.get("base_model_id"), subfolder="scheduler"
         )
+
+        text_encoder.eval()
+        vae.eval()
+        for param in text_encoder.parameters():
+            param.requires_grad = False
+        for param in vae.parameters():
+            param.requires_grad = False
 
         dataset = FluxPersonDataset(self.dataset_dir, resolution=self.config.get("resolution", 512))
         dataloader = DataLoader(
@@ -125,24 +131,23 @@ class FluxLoRATrainer:
             num_workers=0,
         )
 
-        transformer, dataloader = self.accelerator.prepare(transformer, dataloader)
         optimizer = torch.optim.AdamW(
             [p for p in transformer.parameters() if p.requires_grad],
             lr=float(self.config.get("learning_rate", 5e-5)),
         )
-        optimizer = self.accelerator.prepare(optimizer)
+
+        transformer, optimizer, dataloader = self.accelerator.prepare(transformer, optimizer, dataloader)
 
         max_steps = int(self.config.get("max_steps", 1000))
         progress_bar = tqdm(range(max_steps), disable=not self.accelerator.is_local_main_process)
 
-        transformer.train()
         step = 0
         while step < max_steps:
             for batch in dataloader:
-                pixel_values = batch["pixel_values"].to(self.accelerator.device)
                 captions = batch["captions"]
+                caption_texts = [c.strip() if isinstance(c, str) else "" for c in captions]
                 tokenized = tokenizer(
-                    captions,
+                    caption_texts,
                     padding="max_length",
                     truncation=True,
                     max_length=min(tokenizer.model_max_length, 77),
@@ -150,9 +155,11 @@ class FluxLoRATrainer:
                 )
                 input_ids = tokenized["input_ids"].to(self.accelerator.device)
                 attention_mask = tokenized["attention_mask"].to(self.accelerator.device)
+                pixel_values = batch["pixel_values"].to(self.accelerator.device, dtype=dtype)
 
                 with torch.no_grad():
-                    latents = vae.encode(pixel_values).latent_dist.sample() * getattr(vae.config, "scaling_factor", 0.18215)
+                    latents = vae.encode(pixel_values).latent_dist.sample()
+                    latents = latents * getattr(vae.config, "scaling_factor", 0.18215)
                     encoder_hidden_states = text_encoder(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -182,8 +189,12 @@ class FluxLoRATrainer:
 
                 step += 1
                 progress_bar.set_description(f"loss: {loss.item():.4f}")
+                progress_bar.update(1)
                 if step >= max_steps:
                     break
+
+        progress_bar.close()
+        self._save_lora(transformer, text_encoder)
 
         manifest = {
             "training_date": datetime.now().isoformat(),
@@ -196,5 +207,14 @@ class FluxLoRATrainer:
 
         return self.output_dir / "training_manifest.json"
 
+    def _save_lora(self, transformer, text_encoder):
+        ckpt = self.output_dir / "checkpoint-final"
+        ckpt.mkdir(parents=True, exist_ok=True)
+        unwrap = self.accelerator.unwrap_model
+        if hasattr(transformer, "save_pretrained"):
+            unwrap(transformer).save_pretrained(ckpt / "transformer")
+        if text_encoder is not None and hasattr(text_encoder, "save_pretrained"):
+            unwrap(text_encoder).save_pretrained(ckpt / "text_encoder")
 
-__all__ = ["FluxLoRATrainer"]
+
+__all__ = ["FluxLoRATrainer", "FluxPersonDataset"]

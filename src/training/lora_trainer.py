@@ -179,8 +179,7 @@ class PersonDataset(Dataset):
         return {
             'pixel_values': image,
             'input_ids': text_inputs['input_ids'].squeeze(),
-            'attention_mask': text_inputs['attention_mask'].squeeze(),
-            'captions': caption
+            'attention_mask': text_inputs['attention_mask'].squeeze()
         }
 
 
@@ -201,7 +200,6 @@ class LoRATrainer:
         self.model_config = model_config or {}
         self.base_model_path = base_model_path
         self.model_id = self.model_config.get('base_model_id') or self.base_model_path
-        self.model_backend = self.model_config.get('backend', 'flux').lower()
         self.paths = paths or {}
         self.dataset_dir = Path(dataset_dir)
         self.output_dir = Path(output_dir)
@@ -262,38 +260,19 @@ class LoRATrainer:
                 model_dtype = torch.float16
 
         model_id = self.model_id
-        pipeline = None
-
-        if self.model_backend == "flux":
-            from .flux_loader import load_flux_components
-            local_flux_dir = None
-            base_model_dir = self.paths.get('base_model_dir')
-            if base_model_dir:
-                local_flux_dir = Path(base_model_dir) / "flux"
-            pipeline = load_flux_components(
-                model_id,
-                model_dtype,
-                tokenizer_path=tokenizer_override,
-                local_dir=local_flux_dir,
-                revision=self.model_config.get('revision'),
-                variant=self.model_config.get('variant'),
-            )
-            logger.info("✓ Компоненты FLUX.1-dev загружены")
-        else:
-            pipeline = load_qwen_components(
-                model_id,
-                model_dtype,
-                tokenizer_path=tokenizer_override,
-                max_cpu_ram_gb=self.max_cpu_ram_gb,
-                max_vram_gb=self.max_vram_gb,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                offload_state_dict=self.offload_state_dict,
-            )
-            logger.info("✓ Компоненты Qwen-Image загружены")
-
+        pipeline = load_qwen_components(
+            model_id,
+            model_dtype,
+            tokenizer_path=tokenizer_override,
+            max_cpu_ram_gb=self.max_cpu_ram_gb,
+            max_vram_gb=self.max_vram_gb,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            offload_state_dict=self.offload_state_dict,
+        )
+        logger.info("✓ Компоненты Qwen-Image загружены")
         tokenizer = pipeline.tokenizer
         primary_dtype = getattr(pipeline, "dtype", model_dtype)
-        pipeline_type = f"{self.model_backend}:{type(pipeline).__name__}"
+        pipeline_type = type(pipeline).__name__
         trainable_attr = "transformer" if getattr(pipeline, "transformer", None) is not None else "unet"
         logger.info(f"Trainable компонент: {trainable_attr}")
 
@@ -363,24 +342,6 @@ class LoRATrainer:
             text_encoder = get_peft_model(pipeline.text_encoder, text_encoder_lora_config)
             pipeline.text_encoder = text_encoder
             logger.info("✓ LoRA применена к text_encoder")
-
-            if self.model_backend == "flux" and text_encoder is not None:
-                peft_model = text_encoder
-                base_model = getattr(peft_model, "base_model", None)
-                if base_model is None and hasattr(peft_model, "model"):
-                    base_model = peft_model.model
-                if base_model is None:
-                    base_model = peft_model
-
-                orig_forward = base_model.forward
-
-                def forward_no_inputs_embeds(*args, **kwargs):
-                    if "inputs_embeds" in kwargs:
-                        logger.warning("Dropping unsupported kwarg 'inputs_embeds' for CLIPTextModel.forward")
-                        kwargs.pop("inputs_embeds", None)
-                    return orig_forward(*args, **kwargs)
-
-                base_model.forward = forward_no_inputs_embeds
         
         return pipeline, tokenizer, model_dtype
     
@@ -604,35 +565,8 @@ class LoRATrainer:
                     raise ValueError(f"Unexpected pixel_values shape {pixel_values.shape}, expected BCHW")
                 pixel_values = pixel_values.to(device, dtype=primary_dtype)
 
-                if self.model_backend == "flux":
-                    captions = batch.get('captions')
-                    if captions is None:
-                        raise ValueError("Batch is missing 'captions' required for Flux backend")
-                    if isinstance(captions, (list, tuple)):
-                        caption_texts = [c.strip() if isinstance(c, str) else "" for c in captions]
-                    else:
-                        caption_texts = [captions.strip() if isinstance(captions, str) else ""]
-                    max_length = getattr(tokenizer, "model_max_length", 77)
-                    max_length = min(max_length, 77)
-                    tokenized = tokenizer(
-                        caption_texts,
-                        padding="max_length",
-                        truncation=True,
-                        max_length=max_length,
-                        return_tensors="pt"
-                    )
-                    input_ids = tokenized['input_ids'].to(device)
-                    attention_mask = tokenized['attention_mask'].to(device)
-                    logger.info(
-                        "Token check: shape=%s, min=%s, max=%s, vocab_size=%s",
-                        tuple(input_ids.shape),
-                        input_ids.min().item(),
-                        input_ids.max().item(),
-                        getattr(text_encoder.config, 'vocab_size', 'unknown')
-                    )
-                else:
-                    input_ids = batch['input_ids'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
                 
                 # Encode изображения в latent space через VAE
                 # Переместить VAE на GPU только для forward pass
@@ -805,22 +739,14 @@ class LoRATrainer:
                     try:
                         # Попробовать стандартный API для transformer
                         if hasattr(trainable_model, 'forward'):
-                            if self.model_backend == "flux":
-                                model_pred = trainable_model(
-                                    sample=noisy_latents,
-                                    timestep=timesteps,
-                                    encoder_hidden_states=encoder_hidden_states,
-                                    cross_attention_kwargs={}
-                                )
-                            else:
-                                model_pred = trainable_model(
-                                    sample=noisy_latents,
-                                    timestep=timesteps,
-                                    encoder_hidden_states=encoder_hidden_states,
-                                    return_dict=False
-                                )
-                                if isinstance(model_pred, tuple):
-                                    model_pred = model_pred[0]
+                            model_pred = trainable_model(
+                                sample=noisy_latents,
+                                timestep=timesteps,
+                                encoder_hidden_states=encoder_hidden_states,
+                                return_dict=False
+                            )
+                            if isinstance(model_pred, tuple):
+                                model_pred = model_pred[0]
                         else:
                             model_pred = trainable_model(
                                 noisy_latents,

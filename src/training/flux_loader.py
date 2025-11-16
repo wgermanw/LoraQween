@@ -14,33 +14,24 @@ from transformers import AutoProcessor
 logger = logging.getLogger(__name__)
 
 
-def _resolve_model_source(base_model_id: str, local_override: Optional[Path] = None) -> str:
-    """Return path or repo id that should be used for loading."""
-    if local_override and local_override.exists():
-        logger.info("Используется локальная модель Flux: %s", local_override)
-        return str(local_override)
-    if Path(base_model_id).exists():
-        logger.info("Обнаружена локальная директория модели: %s", base_model_id)
-        return str(Path(base_model_id))
-    return base_model_id
+def _resolve_model_source(model_id: str) -> str:
+    """Return local path or repo id for the model."""
+    local_path = Path(model_id)
+    if local_path.exists():
+        logger.info("Используется локальная модель Flux: %s", local_path)
+        return str(local_path)
+    return model_id
 
 
 def load_flux_components(
     model_id: str,
     dtype: torch.dtype,
     *,
-    tokenizer_path: Optional[Path] = None,
-    local_dir: Optional[Path] = None,
     revision: Optional[str] = None,
     variant: Optional[str] = None,
 ) -> SimpleNamespace:
-    """
-    Load FLUX.1-dev pipeline components without aggressive device/offload logic.
-    """
-    if tokenizer_path is not None and not isinstance(tokenizer_path, Path):
-        tokenizer_path = Path(tokenizer_path)
-
-    source = _resolve_model_source(model_id, local_override=local_dir)
+    """Load Flux pipeline using native components only."""
+    source = _resolve_model_source(model_id)
     logger.info("Загрузка FLUX.1-dev из %s (dtype=%s)", source, dtype)
 
     pipeline = DiffusionPipeline.from_pretrained(
@@ -53,9 +44,6 @@ def load_flux_components(
     )
 
     processor = getattr(pipeline, "image_processor", getattr(pipeline, "processor", None))
-
-    tokenizer = getattr(pipeline, "tokenizer", None)
-
     if processor is None:
         try:
             processor = AutoProcessor.from_pretrained(source, trust_remote_code=True)
@@ -66,7 +54,7 @@ def load_flux_components(
         transformer=getattr(pipeline, "transformer", None),
         text_encoder=getattr(pipeline, "text_encoder", None),
         vae=getattr(pipeline, "vae", None),
-        tokenizer=tokenizer,
+        tokenizer=getattr(pipeline, "tokenizer", None),
         processor=processor,
         image_processor=processor,
         scheduler=getattr(pipeline, "scheduler", None),
