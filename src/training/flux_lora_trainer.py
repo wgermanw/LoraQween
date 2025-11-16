@@ -260,13 +260,8 @@ class FluxLoRATrainer:
         max_steps = int(self.config.get("max_steps", 1000))
         progress_bar = tqdm(range(max_steps), disable=not self.accelerator.is_local_main_process)
 
-        # Try to detect expected transformer x-embed input size once
-        try:
-            raw_tx = self.accelerator.unwrap_model(transformer)
-            x_embedder = getattr(raw_tx, "x_embedder", None)
-            x_in_features = getattr(x_embedder, "in_features", None)
-        except Exception:
-            x_in_features = None
+        # We pass BCHW latents directly; let Flux x_embedder handle patchification internally.
+        x_in_features = None
         
         # Try to detect pooled_projection expected dimension for time_text_embed
         pooled_proj_dim = None
@@ -390,37 +385,8 @@ class FluxLoRATrainer:
                 if hasattr(scheduler, "scale_model_input"):
                     model_input = scheduler.scale_model_input(noisy_latents, timesteps)
 
-                # If transformer expects flattened patch vectors (e.g., in_features=3072),
-                # and we currently have BCHW tensors, convert to (B, tokens, in_features)
-                # Track patch grid for img_ids construction
+                # No manual unfold; keep BCHW format for Flux x_embedder
                 patch_grid_h, patch_grid_w = None, None
-                if x_in_features is not None and model_input.ndim == 4:
-                    bsz, channels, height, width = model_input.shape
-                    if x_in_features % channels == 0:
-                        required_area = x_in_features // channels
-                        # Find (kh, kw) such that kh*kw == required_area and divides HxW grid
-                        kh, kw = None, None
-                        # Prefer square-ish factors, but accept any valid tiling
-                        for h_factor in range(int(required_area**0.5), 0, -1):
-                            if required_area % h_factor != 0:
-                                continue
-                            w_factor = required_area // h_factor
-                            if h_factor <= height and w_factor <= width and height % h_factor == 0 and width % w_factor == 0:
-                                kh, kw = h_factor, w_factor
-                                break
-                        # Fallback to row-wise tiling if possible
-                        if kh is None and required_area <= width and width % required_area == 0:
-                            kh, kw = 1, required_area
-                        # Apply unfold if we found a feasible tiling
-                        if kh is not None and kw is not None:
-                            unfolded = F.unfold(model_input, kernel_size=(kh, kw), stride=(kh, kw))  # [B, C*kh*kw, L]
-                            model_input = unfolded.transpose(1, 2).contiguous()  # [B, L, x_in_features]
-                            patch_grid_h = height // kh
-                            patch_grid_w = width // kw
-                        else:
-                            # As a last resort, keep BCHW; the model may still support it
-                            patch_grid_h = height
-                            patch_grid_w = width
 
                 # Prepare required conditioning for Flux time/text embedding
                 bsz = model_input.shape[0]
