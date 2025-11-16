@@ -318,8 +318,19 @@ class FluxLoRATrainer:
                 pixel_values = batch["pixel_values"].to(self.accelerator.device, dtype=dtype)
 
                 with torch.no_grad():
-                    # Use pixel space latents for FLUX (3-channel), not VAE latents
-                    pixel_latents = pixel_values.to(self.accelerator.device, dtype=dtype)
+                    # Encode to FLUX AE latents when available (preferred over raw pixels)
+                    try:
+                        enc_out = vae.encode(pixel_values)
+                        if hasattr(enc_out, "latent_dist"):
+                            pixel_latents = enc_out.latent_dist.sample()
+                        elif hasattr(enc_out, "latents"):
+                            pixel_latents = enc_out.latents
+                        else:
+                            pixel_latents = enc_out
+                    except Exception:
+                        # Fallback to raw pixels if AE encode is unavailable
+                        pixel_latents = pixel_values.to(self.accelerator.device, dtype=dtype)
+                    pixel_latents = pixel_latents.to(self.accelerator.device, dtype=dtype)
                     # T5 for encoder_hidden_states (B, seq, 4096)
                     if t5_text_encoder is not None:
                         t5_out = t5_text_encoder(
