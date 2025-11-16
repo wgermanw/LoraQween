@@ -132,6 +132,49 @@ class FluxLoRATrainer:
                 return tx_orig_forward(*args, **kwargs)
 
             base_tx.forward = tx_forward_filtered
+
+            # Patch x_embedder to apply linear along the last dimension robustly
+            x_emb = getattr(base_tx, "x_embedder", None)
+            if x_emb is not None and hasattr(x_emb, "forward") and hasattr(x_emb, "weight"):
+                x_emb_orig_forward = x_emb.forward
+                weight = getattr(x_emb, "weight", None)
+                bias = getattr(x_emb, "bias", None)
+                in_features = int(weight.shape[1]) if weight is not None else None
+                out_features = int(weight.shape[0]) if weight is not None else None
+
+                def x_emb_forward_safe(hidden_states, *xa, **xk):
+                    # Ensure last dim matches in_features; reshape to 2D for F.linear then restore
+                    if in_features is None:
+                        return x_emb_orig_forward(hidden_states, *xa, **xk)
+                    original_shape = hidden_states.shape
+                    if original_shape[-1] != in_features:
+                        # Try to move channels/features to the last dim if 4D BCHW or BHWC
+                        if hidden_states.ndim == 4:
+                            # Prefer NHWC last-dim arrangement
+                            if original_shape[1] in (in_features, 3, 4, 16):
+                                hidden_states = hidden_states.permute(0, 2, 3, 1).contiguous()
+                            # If still not matching, fallback to flatten spatial and project if divisible
+                            if hidden_states.shape[-1] != in_features:
+                                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                                if flat.shape[-1] == in_features:
+                                    projected = torch.nn.functional.linear(flat, weight, bias)
+                                    return projected.view(*original_shape[:-1], out_features)
+                                else:
+                                    # As a last resort, defer to original
+                                    return x_emb_orig_forward(hidden_states, *xa, **xk)
+                        else:
+                            # Non-4D: flatten last dim if it matches via reshape
+                            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                            if flat.shape[-1] == in_features:
+                                projected = torch.nn.functional.linear(flat, weight, bias)
+                                return projected.view(*original_shape[:-1], out_features)
+                            return x_emb_orig_forward(hidden_states, *xa, **xk)
+                    # Happy path: last dim already matches in_features
+                    flat = hidden_states.reshape(-1, in_features)
+                    projected = torch.nn.functional.linear(flat, weight, bias)
+                    return projected.view(*original_shape[:-1], out_features)
+
+                x_emb.forward = x_emb_forward_safe
         except Exception:
             # If patching fails, proceed without filtering
             pass
