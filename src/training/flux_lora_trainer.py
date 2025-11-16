@@ -442,36 +442,27 @@ class FluxLoRATrainer:
 
                 # Provide txt_ids required by Flux transformer; use simple zero placeholders per token
                 t5_seq_len = int(t5_input_ids.shape[1]) if "t5_input_ids" in locals() else int(clip_input_ids.shape[1])
+                # txt_ids should be 2D [L_txt, 2]
                 txt_ids = torch.zeros(
-                    (bsz, t5_seq_len),
+                    (int(t5_seq_len), 2),
                     device=self.accelerator.device,
                     dtype=dtype,
                 )
-                # Provide img_ids required by Flux transformer; basic zero positions per image token
+                # img_ids should be 2D [L_img, 2]
                 if model_input.ndim == 3:
-                    # [B, L, D] -> create [B, L, 2]
-                    num_tokens = model_input.shape[1]
-                    img_ids = torch.zeros(
-                        (bsz, num_tokens, 2),
-                        device=self.accelerator.device,
-                        dtype=dtype,
-                    )
+                    # [B, L, D] -> create [L, 2]
+                    num_tokens = int(model_input.shape[1])
                 elif model_input.ndim == 4:
-                    # [B, C, H, W] -> create [B, H*W, 2]
+                    # [B, C, H, W] -> create [H*W, 2]
                     _, _, h, w = model_input.shape
                     num_tokens = int(h * w)
-                    img_ids = torch.zeros(
-                        (bsz, num_tokens, 2),
-                        device=self.accelerator.device,
-                        dtype=dtype,
-                    )
                 else:
-                    # Fallback to a single token placeholder
-                    img_ids = torch.zeros(
-                        (bsz, 1, 2),
-                        device=self.accelerator.device,
-                        dtype=dtype,
-                    )
+                    num_tokens = 1
+                img_ids = torch.zeros(
+                    (num_tokens, 2),
+                    device=self.accelerator.device,
+                    dtype=dtype,
+                )
 
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
