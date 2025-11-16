@@ -50,15 +50,19 @@ def load_flux_components(
         except Exception:
             processor = None
 
-    # Prefer FLUX T5 text encoder/tokenizer (text_encoder_2/tokenizer_2) when available.
-    text_encoder = getattr(pipeline, "text_encoder_2", None) or getattr(pipeline, "text_encoder", None)
-    tokenizer = getattr(pipeline, "tokenizer_2", None) or getattr(pipeline, "tokenizer", None)
+    # Expose both CLIP (text_encoder/tokenizer) and T5 (text_encoder_2/tokenizer_2) when available.
+    text_encoder = getattr(pipeline, "text_encoder", None)
+    text_encoder_2 = getattr(pipeline, "text_encoder_2", None)
+    tokenizer = getattr(pipeline, "tokenizer", None)
+    tokenizer_2 = getattr(pipeline, "tokenizer_2", None)
 
     components = SimpleNamespace(
         transformer=getattr(pipeline, "transformer", None),
         text_encoder=text_encoder,
+        text_encoder_2=text_encoder_2,
         vae=getattr(pipeline, "vae", None),
         tokenizer=tokenizer,
+        tokenizer_2=tokenizer_2,
         processor=processor,
         image_processor=processor,
         scheduler=getattr(pipeline, "scheduler", None),

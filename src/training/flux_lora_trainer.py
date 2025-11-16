@@ -216,18 +216,28 @@ class FluxLoRATrainer:
 
     def train(self):
         components, dtype = self.setup()
-        tokenizer = components.tokenizer
+        clip_tokenizer = components.tokenizer
+        t5_tokenizer = getattr(components, "tokenizer_2", None)
         vae = components.vae.to(self.accelerator.device, dtype=dtype)
-        text_encoder = components.text_encoder.to(self.accelerator.device, dtype=dtype)
+        clip_text_encoder = components.text_encoder.to(self.accelerator.device, dtype=dtype) if components.text_encoder is not None else None
+        t5_text_encoder = getattr(components, "text_encoder_2", None)
+        if t5_text_encoder is not None:
+            t5_text_encoder = t5_text_encoder.to(self.accelerator.device, dtype=dtype)
         transformer = components.transformer
         scheduler = components.scheduler or DDPMScheduler.from_pretrained(
             self.model_config.get("base_model_id"), subfolder="scheduler"
         )
 
-        text_encoder.eval()
+        if clip_text_encoder is not None:
+            clip_text_encoder.eval()
         vae.eval()
-        for param in text_encoder.parameters():
-            param.requires_grad = False
+        if clip_text_encoder is not None:
+            for param in clip_text_encoder.parameters():
+                param.requires_grad = False
+        if t5_text_encoder is not None:
+            t5_text_encoder.eval()
+            for param in t5_text_encoder.parameters():
+                param.requires_grad = False
         for param in vae.parameters():
             param.requires_grad = False
 
@@ -282,24 +292,72 @@ class FluxLoRATrainer:
             for batch in dataloader:
                 captions = batch["captions"]
                 caption_texts = [c.strip() if isinstance(c, str) else "" for c in captions]
-                tokenized = tokenizer(
+                # Tokenize for CLIP (for pooled_projections, dim 768)
+                clip_tok = clip_tokenizer(
                     caption_texts,
                     padding="max_length",
                     truncation=True,
-                    max_length=min(tokenizer.model_max_length, 77),
+                    max_length=min(getattr(clip_tokenizer, "model_max_length", 77), 77),
                     return_tensors="pt",
                 )
-                input_ids = tokenized["input_ids"].to(self.accelerator.device)
-                attention_mask = tokenized["attention_mask"].to(self.accelerator.device)
+                clip_input_ids = clip_tok["input_ids"].to(self.accelerator.device)
+                clip_attention_mask = clip_tok["attention_mask"].to(self.accelerator.device)
+
+                # Tokenize for T5 (for encoder_hidden_states, dim 4096)
+                if t5_tokenizer is not None:
+                    t5_tok = t5_tokenizer(
+                        caption_texts,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=min(getattr(t5_tokenizer, "model_max_length", 512), 512),
+                        return_tensors="pt",
+                    )
+                    t5_input_ids = t5_tok["input_ids"].to(self.accelerator.device)
+                    t5_attention_mask = t5_tok["attention_mask"].to(self.accelerator.device)
+                else:
+                    # Fallback: use CLIP tokens if T5 tokenizer missing
+                    t5_input_ids = clip_input_ids
+                    t5_attention_mask = clip_attention_mask
                 pixel_values = batch["pixel_values"].to(self.accelerator.device, dtype=dtype)
 
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * getattr(vae.config, "scaling_factor", 0.18215)
-                    encoder_hidden_states = text_encoder(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                    )[0]
+                    # T5 for encoder_hidden_states (B, seq, 4096)
+                    if t5_text_encoder is not None:
+                        t5_out = t5_text_encoder(
+                            input_ids=t5_input_ids,
+                            attention_mask=t5_attention_mask,
+                            return_dict=True,
+                        )
+                        encoder_hidden_states = getattr(t5_out, "last_hidden_state", None)
+                        if encoder_hidden_states is None:
+                            encoder_hidden_states = t5_out[0]
+                    else:
+                        # Fallback to CLIP last_hidden_state (dim 768)
+                        clip_out_fallback = clip_text_encoder(
+                            input_ids=clip_input_ids,
+                            attention_mask=clip_attention_mask,
+                            return_dict=True,
+                        )
+                        encoder_hidden_states = getattr(clip_out_fallback, "last_hidden_state", None)
+                        if encoder_hidden_states is None:
+                            encoder_hidden_states = clip_out_fallback[0]
+                    # CLIP pooled for pooled_projections (B, 768)
+                    pooled_from_clip = None
+                    if clip_text_encoder is not None:
+                        clip_out = clip_text_encoder(
+                            input_ids=clip_input_ids,
+                            attention_mask=clip_attention_mask,
+                            return_dict=True,
+                        )
+                        pooled_from_clip = getattr(clip_out, "pooler_output", None)
+                        if pooled_from_clip is None:
+                            # mean pool across sequence
+                            last_hidden = getattr(clip_out, "last_hidden_state", None)
+                            if last_hidden is None:
+                                last_hidden = clip_out[0]
+                            pooled_from_clip = last_hidden.mean(dim=1)
 
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(
@@ -370,21 +428,17 @@ class FluxLoRATrainer:
                     device=self.accelerator.device,
                     dtype=dtype,
                 )
-                # Try to form pooled_projections from encoder_hidden_states if dimensions match, else zeros
-                pooled_projections = None
-                if pooled_proj_dim is not None:
-                    pooled_from_text = encoder_hidden_states.mean(dim=1)
-                    if pooled_from_text.shape[-1] == pooled_proj_dim:
-                        pooled_projections = pooled_from_text
-                    else:
-                        pooled_projections = torch.zeros(
-                            (bsz, pooled_proj_dim),
-                            device=self.accelerator.device,
-                            dtype=dtype,
-                        )
+                # Prepare pooled_projections from CLIP pooled output (expected dim 768 for Flux)
+                if pooled_proj_dim is not None and pooled_from_clip is not None and pooled_from_clip.shape[-1] == pooled_proj_dim:
+                    pooled_projections = pooled_from_clip
                 else:
-                    # Fallback to mean-pooled text; Flux may project internally
-                    pooled_projections = encoder_hidden_states.mean(dim=1)
+                    # Fallback to zeros if dimension mismatch
+                    target_dim = pooled_proj_dim if pooled_proj_dim is not None else (pooled_from_clip.shape[-1] if pooled_from_clip is not None else 768)
+                    pooled_projections = torch.zeros(
+                        (bsz, target_dim),
+                        device=self.accelerator.device,
+                        dtype=dtype,
+                    )
 
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
