@@ -12,6 +12,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
+import math
 from diffusers import DDPMScheduler
 from peft import LoraConfig, get_peft_model, TaskType
 from torch.utils.data import Dataset, DataLoader
@@ -391,6 +392,8 @@ class FluxLoRATrainer:
 
                 # If transformer expects flattened patch vectors (e.g., in_features=3072),
                 # and we currently have BCHW tensors, convert to (B, tokens, in_features)
+                # Track patch grid for img_ids construction
+                patch_grid_h, patch_grid_w = None, None
                 if x_in_features is not None and model_input.ndim == 4:
                     bsz, channels, height, width = model_input.shape
                     if x_in_features % channels == 0:
@@ -412,9 +415,12 @@ class FluxLoRATrainer:
                         if kh is not None and kw is not None:
                             unfolded = F.unfold(model_input, kernel_size=(kh, kw), stride=(kh, kw))  # [B, C*kh*kw, L]
                             model_input = unfolded.transpose(1, 2).contiguous()  # [B, L, x_in_features]
+                            patch_grid_h = height // kh
+                            patch_grid_w = width // kw
                         else:
                             # As a last resort, keep BCHW; the model may still support it
-                            pass
+                            patch_grid_h = height
+                            patch_grid_w = width
 
                 # Prepare required conditioning for Flux time/text embedding
                 bsz = model_input.shape[0]
@@ -440,29 +446,43 @@ class FluxLoRATrainer:
                         dtype=dtype,
                     )
 
-                # Provide txt_ids required by Flux transformer; use simple zero placeholders per token
+                # Provide txt_ids required by Flux transformer; simple zero placeholders per token (2D with 2 coords)
                 t5_seq_len = int(t5_input_ids.shape[1]) if "t5_input_ids" in locals() else int(clip_input_ids.shape[1])
-                # txt_ids should be 2D [L_txt, 512]
                 txt_ids = torch.zeros(
-                    (int(t5_seq_len), 512),
+                    (int(t5_seq_len), 2),
                     device=self.accelerator.device,
-                    dtype=dtype,
+                    dtype=torch.long,
                 )
-                # img_ids should be 2D [L_img, 512]
+                # img_ids should be 2D [L_img, 2] with grid coordinates
                 if model_input.ndim == 3:
                     # [B, L, D] -> create [L, 2]
                     num_tokens = int(model_input.shape[1])
+                    if patch_grid_h is None or patch_grid_w is None:
+                        # Try to infer square-ish grid
+                        g_h = int(math.sqrt(num_tokens))
+                        g_h = max(1, g_h)
+                        g_w = max(1, num_tokens // g_h)
+                    else:
+                        g_h, g_w = int(patch_grid_h), int(patch_grid_w)
+                    row = torch.arange(g_h, device=self.accelerator.device, dtype=torch.long).repeat_interleave(g_w)
+                    col = torch.arange(g_w, device=self.accelerator.device, dtype=torch.long).repeat(g_h)
+                    img_ids = torch.stack([row, col], dim=1)
+                    if img_ids.shape[0] != num_tokens:
+                        # Adjust by trimming or padding zeros
+                        if img_ids.shape[0] > num_tokens:
+                            img_ids = img_ids[:num_tokens]
+                        else:
+                            pad = torch.zeros((num_tokens - img_ids.shape[0], 2), device=img_ids.device, dtype=img_ids.dtype)
+                            img_ids = torch.cat([img_ids, pad], dim=0)
                 elif model_input.ndim == 4:
                     # [B, C, H, W] -> create [H*W, 2]
                     _, _, h, w = model_input.shape
                     num_tokens = int(h * w)
+                    row = torch.arange(h, device=self.accelerator.device, dtype=torch.long).repeat_interleave(w)
+                    col = torch.arange(w, device=self.accelerator.device, dtype=torch.long).repeat(h)
+                    img_ids = torch.stack([row, col], dim=1)
                 else:
-                    num_tokens = 1
-                img_ids = torch.zeros(
-                    (num_tokens, 512),
-                    device=self.accelerator.device,
-                    dtype=dtype,
-                )
+                    img_ids = torch.zeros((1, 2), device=self.accelerator.device, dtype=torch.long)
 
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
