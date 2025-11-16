@@ -261,12 +261,8 @@ class FluxLoRATrainer:
         progress_bar = tqdm(range(max_steps), disable=not self.accelerator.is_local_main_process)
 
         # Detect expected x_embedder input features (e.g., 3072 for FLUX.1-dev)
-        try:
-            raw_tx = self.accelerator.unwrap_model(transformer)
-            x_embedder = getattr(raw_tx, "x_embedder", None)
-            x_in_features = getattr(x_embedder, "in_features", None)
-        except Exception:
-            x_in_features = None
+        # Пусть Flux сам выполняет патчизацию (не делаем вручную)
+        x_in_features = None
         
         # Try to detect pooled_projection expected dimension for time_text_embed
         pooled_proj_dim = None
@@ -402,44 +398,8 @@ class FluxLoRATrainer:
                 if hasattr(scheduler, "scale_model_input"):
                     model_input = scheduler.scale_model_input(noisy_latents, timesteps)
 
-                # If transformer expects flattened patch vectors (e.g., in_features=3072),
-                # and we currently have BCHW tensors, convert to (B, tokens, in_features)
+                # Не делаем ручной unfold — оставляем BCHW
                 patch_grid_h, patch_grid_w = None, None
-                if x_in_features is not None and model_input.ndim == 4:
-                    bsz, channels, height, width = model_input.shape
-                    if x_in_features % max(channels, 1) == 0:
-                        required_area = x_in_features // max(channels, 1)
-                        # Search factor pairs (kh, kw) such that kh*kw == required_area and divides HxW
-                        best_pair = None
-                        best_score = 1e9
-                        # Enumerate divisors
-                        for kh in range(1, int(math.sqrt(required_area)) + 1):
-                            if required_area % kh != 0:
-                                continue
-                            kw = required_area // kh
-                            if kh <= height and kw <= width and height % kh == 0 and width % kw == 0:
-                                # Prefer more square token grid
-                                gh = height // kh
-                                gw = width // kw
-                                score = abs(gh - gw)
-                                if score < best_score:
-                                    best_score = score
-                                    best_pair = (kh, kw)
-                            # Also try swapped factors
-                            if kw <= height and kh <= width and height % kw == 0 and width % kh == 0:
-                                gh = height // kw
-                                gw = width // kh
-                                score = abs(gh - gw)
-                                if score < best_score:
-                                    best_score = score
-                                    best_pair = (kw, kh)
-                        if best_pair is not None:
-                            kh, kw = best_pair
-                            unfolded = F.unfold(model_input, kernel_size=(kh, kw), stride=(kh, kw))  # [B, C*kh*kw, L]
-                            model_input = unfolded.transpose(1, 2).contiguous()  # [B, L, x_in_features]
-                            patch_grid_h = height // kh
-                            patch_grid_w = width // kw
-                        # else: keep BCHW and let model handle if possible
 
                 # Prepare required conditioning for Flux time/text embedding
                 bsz = model_input.shape[0]
@@ -465,43 +425,7 @@ class FluxLoRATrainer:
                         dtype=dtype,
                     )
 
-                # Provide txt_ids required by Flux transformer; simple zero placeholders per token (2D with 2 coords)
-                t5_seq_len = int(t5_input_ids.shape[1]) if "t5_input_ids" in locals() else int(clip_input_ids.shape[1])
-                txt_ids = torch.zeros(
-                    (int(t5_seq_len), 2),
-                    device=self.accelerator.device,
-                    dtype=torch.long,
-                )
-                # img_ids should be 2D [L_img, 2] with grid coordinates
-                if model_input.ndim == 3:
-                    # [B, L, D] -> create [L, 2]
-                    num_tokens = int(model_input.shape[1])
-                    if patch_grid_h is None or patch_grid_w is None:
-                        # Try to infer square-ish grid
-                        g_h = int(math.sqrt(num_tokens))
-                        g_h = max(1, g_h)
-                        g_w = max(1, num_tokens // g_h)
-                    else:
-                        g_h, g_w = int(patch_grid_h), int(patch_grid_w)
-                    row = torch.arange(g_h, device=self.accelerator.device, dtype=torch.long).repeat_interleave(g_w)
-                    col = torch.arange(g_w, device=self.accelerator.device, dtype=torch.long).repeat(g_h)
-                    img_ids = torch.stack([row, col], dim=1)
-                    if img_ids.shape[0] != num_tokens:
-                        # Adjust by trimming or padding zeros
-                        if img_ids.shape[0] > num_tokens:
-                            img_ids = img_ids[:num_tokens]
-                        else:
-                            pad = torch.zeros((num_tokens - img_ids.shape[0], 2), device=img_ids.device, dtype=img_ids.dtype)
-                            img_ids = torch.cat([img_ids, pad], dim=0)
-                elif model_input.ndim == 4:
-                    # [B, C, H, W] -> create [H*W, 2]
-                    _, _, h, w = model_input.shape
-                    num_tokens = int(h * w)
-                    row = torch.arange(h, device=self.accelerator.device, dtype=torch.long).repeat_interleave(w)
-                    col = torch.arange(w, device=self.accelerator.device, dtype=torch.long).repeat(h)
-                    img_ids = torch.stack([row, col], dim=1)
-                else:
-                    img_ids = torch.zeros((1, 2), device=self.accelerator.device, dtype=torch.long)
+                # Не передаём txt_ids/img_ids — пусть Flux сам их построит
 
                 with self.accelerator.accumulate(transformer):
                     # Flux transformer expects hidden_states + timestep + encoder_hidden_states
@@ -511,8 +435,6 @@ class FluxLoRATrainer:
                         encoder_hidden_states=encoder_hidden_states,
                         guidance=guidance_vec,
                         pooled_projections=pooled_projections,
-                        txt_ids=txt_ids,
-                        img_ids=img_ids,
                         return_dict=False,
                     )
                     model_pred = model_out[0] if isinstance(model_out, (tuple, list)) else model_out
