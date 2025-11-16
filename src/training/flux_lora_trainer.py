@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict
 
 import torch
+import torch.nn as nn
 from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from peft import LoraConfig, get_peft_model, TaskType
@@ -134,51 +135,82 @@ class FluxLoRATrainer:
             # If patching fails, proceed without filtering
             pass
 
-        if self.config.get("text_encoder_target_modules"):
-            text_cfg = LoraConfig(
-                r=int(self.config.get("lora_rank", 16)),
-                lora_alpha=int(self.config.get("lora_alpha", 32)),
-                lora_dropout=float(self.config.get("lora_dropout", 0.0)),
-                target_modules=self.config.get("text_encoder_target_modules", []),
-                bias="none",
-                task_type=TaskType.FEATURE_EXTRACTION,
-            )
-            components.text_encoder = get_peft_model(components.text_encoder, text_cfg)
+        if components.text_encoder is not None:
+            # Determine appropriate target modules for text encoder (CLIP vs T5)
+            requested_targets = self.config.get("text_encoder_target_modules")
+            # Collect module names to detect availability
+            module_names = [name for name, _ in components.text_encoder.named_modules()]
 
-            # Patch CLIP text encoder forward to discard unsupported kwargs such as inputs_embeds.
-            peft_model = components.text_encoder
-            base_model = getattr(peft_model, "base_model", None)
-            if base_model is None and hasattr(peft_model, "model"):
-                base_model = peft_model.model
-            if base_model is None:
-                base_model = peft_model
+            def has_mod(mod_name: str) -> bool:
+                dot = f".{mod_name}"
+                return any(n.endswith(dot) or n == mod_name for n in module_names)
 
-            orig_forward = base_model.forward
-            # Use an allowlist of known-safe kwargs for CLIPTextModel to avoid
-            # accidentally dropping required ones due to wrapper layers.
-            allowed_keys = {
-                "input_ids",
-                "attention_mask",
-                "position_ids",
-                "return_dict",
-                "output_attentions",
-                "output_hidden_states",
-            }
+            text_targets: list[str] = []
+            if requested_targets:
+                # Use requested only if at least one target exists
+                if any(has_mod(t) for t in requested_targets):
+                    text_targets = list(requested_targets)
+                else:
+                    logger.warning("Requested text_encoder_target_modules %s not found, auto-detecting...",
+                                   requested_targets)
+            if not text_targets:
+                # Prefer CLIP-style if present
+                out_name = "out_proj" if has_mod("out_proj") else ("o_proj" if has_mod("o_proj") else None)
+                if has_mod("q_proj") and has_mod("k_proj") and has_mod("v_proj") and out_name:
+                    text_targets = ["q_proj", "k_proj", "v_proj", out_name]
+                # Else try T5-style names
+                elif has_mod("q") and has_mod("k") and has_mod("v") and has_mod("o"):
+                    text_targets = ["q", "k", "v", "o"]
+                else:
+                    # As a last resort, include whichever of common names are present
+                    common = ["q_proj", "k_proj", "v_proj", "out_proj", "o_proj", "q", "k", "v", "o"]
+                    text_targets = [t for t in common if has_mod(t)]
 
-            def forward_filtered(*args, **kwargs):
-                removed = []
-                for key in list(kwargs.keys()):
-                    if key not in allowed_keys:
-                        kwargs.pop(key, None)
-                        removed.append(key)
-                if removed:
-                    logger.warning(
-                        "Dropping unsupported kwargs %s for CLIPTextModel.forward",
-                        ", ".join(sorted(set(removed))),
-                    )
-                return orig_forward(*args, **kwargs)
+            if text_targets:
+                text_cfg = LoraConfig(
+                    r=int(self.config.get("lora_rank", 16)),
+                    lora_alpha=int(self.config.get("lora_alpha", 32)),
+                    lora_dropout=float(self.config.get("lora_dropout", 0.0)),
+                    target_modules=text_targets,
+                    bias="none",
+                    task_type=TaskType.FEATURE_EXTRACTION,
+                )
+                components.text_encoder = get_peft_model(components.text_encoder, text_cfg)
 
-            base_model.forward = forward_filtered
+                # Patch text encoder forward to discard unsupported kwargs such as inputs_embeds.
+                peft_model = components.text_encoder
+                base_model = getattr(peft_model, "base_model", None)
+                if base_model is None and hasattr(peft_model, "model"):
+                    base_model = peft_model.model
+                if base_model is None:
+                    base_model = peft_model
+
+                orig_forward = base_model.forward
+                allowed_keys = {
+                    "input_ids",
+                    "attention_mask",
+                    "position_ids",
+                    "return_dict",
+                    "output_attentions",
+                    "output_hidden_states",
+                }
+
+                def forward_filtered(*args, **kwargs):
+                    removed = []
+                    for key in list(kwargs.keys()):
+                        if key not in allowed_keys:
+                            kwargs.pop(key, None)
+                            removed.append(key)
+                    if removed:
+                        logger.warning(
+                            "Dropping unsupported kwargs %s for text_encoder.forward",
+                            ", ".join(sorted(set(removed))),
+                        )
+                    return orig_forward(*args, **kwargs)
+
+                base_model.forward = forward_filtered
+            else:
+                logger.warning("No matching target modules found in text_encoder; skipping LoRA on text_encoder.")
 
         return components, dtype
 
