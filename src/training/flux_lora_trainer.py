@@ -119,6 +119,7 @@ class FluxLoRATrainer:
             }
 
             def tx_forward_filtered(*args, **kwargs):
+                # 1) Отфильтровать мусорные kwargs
                 removed = []
                 for key in list(kwargs.keys()):
                     if key not in tx_allowed_keys:
@@ -129,6 +130,63 @@ class FluxLoRATrainer:
                         "Dropping unsupported kwargs %s for FluxTransformer2DModel.forward",
                         ", ".join(sorted(set(removed))),
                     )
+
+                # 2) Достать hidden_states и encoder_hidden_states из args/kwargs
+                hidden_states = kwargs.get("hidden_states", None)
+                if hidden_states is None and len(args) > 0:
+                    hidden_states = args[0]
+                encoder_hidden_states = kwargs.get("encoder_hidden_states", None)
+
+                # 3) Определить device для новых тензоров
+                device = None
+                if isinstance(hidden_states, torch.Tensor):
+                    device = hidden_states.device
+                elif isinstance(encoder_hidden_states, torch.Tensor):
+                    device = encoder_hidden_states.device
+                else:
+                    device = torch.device("cpu")
+
+                # 4) Гарантировать txt_ids: 2D long-тензор [T_txt, 3]
+                txt_ids = kwargs.get("txt_ids", None)
+                if txt_ids is None:
+                    if isinstance(encoder_hidden_states, torch.Tensor) and encoder_hidden_states.ndim >= 2:
+                        txt_len = int(encoder_hidden_states.shape[1])
+                    else:
+                        txt_len = 1
+                    txt_pos = torch.arange(txt_len, device=device, dtype=torch.long)
+                    # Простейшая схема: t=0, h=0, w=индекс
+                    txt_ids = torch.stack(
+                        [
+                            torch.zeros_like(txt_pos),  # time
+                            torch.zeros_like(txt_pos),  # height
+                            txt_pos,                    # width / порядковый индекс токена
+                        ],
+                        dim=-1,
+                    )
+                    kwargs["txt_ids"] = txt_ids
+
+                # 5) Гарантировать img_ids: 2D long-тензор [T_img, 3]
+                img_ids = kwargs.get("img_ids", None)
+                if img_ids is None:
+                    if isinstance(hidden_states, torch.Tensor) and hidden_states.ndim == 3:
+                        img_len = int(hidden_states.shape[1])
+                    else:
+                        img_len = 1
+                    img_pos = torch.arange(img_len, device=device, dtype=torch.long)
+                    # Прикидываем квадратичную "сетку" по высоте/ширине
+                    side = int(math.ceil(math.sqrt(float(img_len))))
+                    h = img_pos // side
+                    w = img_pos % side
+                    img_ids = torch.stack(
+                        [
+                            torch.ones_like(img_pos),  # time = 1 для картинки
+                            h,
+                            w,
+                        ],
+                        dim=-1,
+                    )
+                    kwargs["img_ids"] = img_ids
+
                 return tx_orig_forward(*args, **kwargs)
 
             base_tx.forward = tx_forward_filtered
