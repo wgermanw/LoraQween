@@ -319,6 +319,18 @@ class FluxLoRATrainer:
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * getattr(vae.config, "scaling_factor", 0.18215)
+                    # Ensure expected channel count (4) for Flux x_embedder (4 * patch_area = 64 in_features)
+                    if latents.ndim == 4 and latents.shape[1] != 4:
+                        c = latents.shape[1]
+                        if c > 4:
+                            latents = latents[:, :4, :, :]
+                        else:
+                            pad = torch.zeros(
+                                (latents.shape[0], 4 - c, latents.shape[2], latents.shape[3]),
+                                device=latents.device,
+                                dtype=latents.dtype,
+                            )
+                            latents = torch.cat([latents, pad], dim=1)
                     # T5 for encoder_hidden_states (B, seq, 4096)
                     if t5_text_encoder is not None:
                         t5_out = t5_text_encoder(
