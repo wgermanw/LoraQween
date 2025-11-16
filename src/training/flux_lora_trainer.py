@@ -209,11 +209,31 @@ class FluxLoRATrainer:
                     device=latents.device,
                     dtype=torch.long,
                 )
-                noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+                # Add noise depending on scheduler capabilities
+                if hasattr(scheduler, "add_noise"):
+                    timesteps = timesteps.to(latents.device)
+                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+                elif hasattr(scheduler, "sigmas"):
+                    indices = timesteps
+                    if indices.dtype != torch.long:
+                        indices = indices.to(torch.long)
+                    indices = indices.to(device=scheduler.sigmas.device)
+                    sigmas = scheduler.sigmas[indices]
+                    sigmas = sigmas.to(latents.device)
+                    while sigmas.ndim < latents.ndim:
+                        sigmas = sigmas.view(-1, *([1] * (latents.ndim - 1)))
+                    noisy_latents = latents + sigmas * noise
+                else:
+                    noisy_latents = latents + noise
+                
+                # Scale input for scheduler if required
+                model_input = noisy_latents
+                if hasattr(scheduler, "scale_model_input"):
+                    model_input = scheduler.scale_model_input(noisy_latents, timesteps)
 
                 with self.accelerator.accumulate(transformer):
                     model_pred = transformer(
-                        sample=noisy_latents,
+                        sample=model_input,
                         timestep=timesteps,
                         encoder_hidden_states=encoder_hidden_states,
                         cross_attention_kwargs={},
