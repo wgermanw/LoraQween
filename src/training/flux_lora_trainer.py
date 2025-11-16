@@ -93,6 +93,45 @@ class FluxLoRATrainer:
             task_type=TaskType.FEATURE_EXTRACTION,
         )
         components.transformer = get_peft_model(components.transformer, lora_cfg)
+        # Patch Flux transformer forward to discard any stray/unsupported kwargs (e.g., input_ids)
+        try:
+            peft_tx = components.transformer
+            base_tx = getattr(peft_tx, "base_model", None)
+            if base_tx is None and hasattr(peft_tx, "model"):
+                base_tx = peft_tx.model
+            if base_tx is None:
+                base_tx = peft_tx
+            tx_orig_forward = base_tx.forward
+            tx_allowed_keys = {
+                "hidden_states",
+                "timestep",
+                "encoder_hidden_states",
+                "pooled_projections",
+                "guidance",
+                "txt_ids",
+                "img_ids",
+                "controlnet_block_samples",
+                "controlnet_single_block_samples",
+                "return_dict",
+            }
+
+            def tx_forward_filtered(*args, **kwargs):
+                removed = []
+                for key in list(kwargs.keys()):
+                    if key not in tx_allowed_keys:
+                        kwargs.pop(key, None)
+                        removed.append(key)
+                if removed:
+                    logger.warning(
+                        "Dropping unsupported kwargs %s for FluxTransformer2DModel.forward",
+                        ", ".join(sorted(set(removed))),
+                    )
+                return tx_orig_forward(*args, **kwargs)
+
+            base_tx.forward = tx_forward_filtered
+        except Exception:
+            # If patching fails, proceed without filtering
+            pass
 
         if self.config.get("text_encoder_target_modules"):
             text_cfg = LoraConfig(
