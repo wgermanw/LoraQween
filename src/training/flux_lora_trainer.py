@@ -442,13 +442,13 @@ class FluxLoRATrainer:
 
                 # Provide txt_ids required by Flux transformer; use simple zero placeholders per token
                 t5_seq_len = int(t5_input_ids.shape[1]) if "t5_input_ids" in locals() else int(clip_input_ids.shape[1])
-                # txt_ids should be 2D [L_txt, 2]
+                # txt_ids should be 2D [L_txt, 512]
                 txt_ids = torch.zeros(
-                    (int(t5_seq_len), 2),
+                    (int(t5_seq_len), 512),
                     device=self.accelerator.device,
                     dtype=dtype,
                 )
-                # img_ids should be 2D [L_img, 2]
+                # img_ids should be 2D [L_img, 512]
                 if model_input.ndim == 3:
                     # [B, L, D] -> create [L, 2]
                     num_tokens = int(model_input.shape[1])
@@ -459,7 +459,7 @@ class FluxLoRATrainer:
                 else:
                     num_tokens = 1
                 img_ids = torch.zeros(
-                    (num_tokens, 2),
+                    (num_tokens, 512),
                     device=self.accelerator.device,
                     dtype=dtype,
                 )
