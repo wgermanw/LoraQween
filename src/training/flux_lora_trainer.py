@@ -374,6 +374,13 @@ class FluxLoRATrainer:
                 model_input = (1 - t.view(bsz, 1, 1, 1)) * pixel_latents + t.view(bsz, 1, 1, 1) * noise
                 timesteps = t  # pass continuous t to transformer
 
+                # Flux x_embedder expects NHWC (B, H, W, C) with C=3; convert if BCHW provided
+                if model_input.ndim == 4 and model_input.shape[1] in (3, 4, 16):
+                    # If AE produced more channels, keep first 3 for RGB-like input
+                    if model_input.shape[1] > 3:
+                        model_input = model_input[:, :3, :, :]
+                    model_input = model_input.permute(0, 2, 3, 1).contiguous()
+
                 # Не делаем ручной unfold — оставляем BCHW
                 patch_grid_h, patch_grid_w = None, None
 
