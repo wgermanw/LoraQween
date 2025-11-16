@@ -56,11 +56,16 @@ def load_flux_components(
     tokenizer = getattr(pipeline, "tokenizer", None)
     tokenizer_2 = getattr(pipeline, "tokenizer_2", None)
 
+    # Prefer Flux AE if available (has 16-channel latents), fallback to VAE
+    ae = getattr(pipeline, "ae", None)
+    vae = getattr(pipeline, "vae", None)
+    latent_encoder = ae or vae
+
     components = SimpleNamespace(
         transformer=getattr(pipeline, "transformer", None),
         text_encoder=text_encoder,
         text_encoder_2=text_encoder_2,
-        vae=getattr(pipeline, "vae", None),
+        vae=latent_encoder,
         tokenizer=tokenizer,
         tokenizer_2=tokenizer_2,
         processor=processor,
